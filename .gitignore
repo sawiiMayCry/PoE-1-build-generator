@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+.env
+.env.*
+*.log
+server_legacy.py
+app_legacy.jsx

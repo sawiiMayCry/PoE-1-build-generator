@@ -1,33 +1,27 @@
-# Witchcraft — Path of Exile Witch Build Planner
+# Witchcraft — local PoE 1 Witch build generator
 
-Small no-dependency Node.js app for current-league Witch build references, PoB passive-tree previews, and live unique-item market estimates.
+Describe a Witch build in plain language. A local Ollama model chooses a current skill core, passive, support gem, and proposed equipment changes. Witchcraft constructs a new Path of Building (PoB) export, checks it with your installed PoB Community, keeps source gear when a swap breaks requirements, prices equipped items, and publishes the exact validated export to pobb.in.
 
-## Run it on Windows
+## Start on Windows
 
-Double-click [`start.bat`](start.bat). It starts the local app and opens it in your browser at <http://127.0.0.1:4173>. Keep the command window open while using the planner; closing it stops the local server.
+Install and update [Path of Building Community](https://github.com/PathOfBuildingCommunity/PathOfBuilding), [Ollama](https://ollama.com/), and Python 3.10 or later. Pull a local model such as `ollama pull qwen2.5:7b` or `ollama pull gemma3:4b`. Start Ollama, then double-click `start.bat` or run `python server.py`. Open <http://127.0.0.1:4173>.
 
-## Run it on another computer or operating system
+If Python is not on `PATH`, set `WITCHCRAFT_PYTHON` to its executable and run `start.bat`. `WITCHCRAFT_POB_HOME` overrides PoB detection; `WITCHCRAFT_OLLAMA_URL`, `WITCHCRAFT_MODEL`, and `PORT` configure Ollama and the local server. The browser assets have no CDN or npm dependencies.
 
-Requires Node.js 18 or newer.
+Try prompts such as “zombie necromancer”, “tanky Bane of Condemnation Occultist”, or “cold Vortex Occultist with more damage”. The model selector chooses the local Ollama model, not a predefined build. The server has no four-build selection endpoint.
 
-```sh
-node server.js
-```
+## Generation and validation
 
-Then open <http://127.0.0.1:4173>. The local server serves the app and proxies/caches the supported poe.ninja economy endpoints. Price data is cached for five minutes. The passive tree is read from GGG's public skill-tree export, and allocations are decoded from the public Path of Building exports.
+The generator assembles real PoB components from cached current-tree Witch references, plus official installed gem and tree data. The model plans the combination from the prompt; it cannot supply arbitrary passive, item, or gem IDs. Raise Zombie uses PoB's installed gem definition in a current Necromancer minion core. The available skill range depends on compatible source builds. If a named skill has no viable pattern, the app reports that instead of silently replacing it. Source PoBs are cached in `data/reference_cache/`; generated exports are saved in `data/generated/`.
 
-The project folder can be copied to another computer. Install Node.js 18 or newer there and run `node server.js` (or double-click `start.bat` on Windows). Nothing is deployed or shared automatically.
+Each candidate must use the current official passive tree and installed PoB definitions, fit its main skill into equipped sockets, preserve a complete gear set, and stay within passive and ascendancy limits. Witchcraft calculates the exact generated XML with PoB and checks health, elemental resistances, attribute requirements, and nonzero offense. Invalid plans are retried with failure feedback. These checks are a minimum viability gate, not a guarantee of optimized gameplay.
 
-## Data and limits
+The app reads the active PoE 1 trade league from [poe.ninja](https://poe.ninja/docs/api), passive nodes from [Grinding Gear Games](https://github.com/grindinggear/skilltree-export), and local game definitions from PoB Community. It stops if required current data is unavailable.
 
-- Curated Witch builds are league-specific 3.29 Curse of the Allflame guides. Verify the selected variant and patch before spending currency if the game has moved to another league; the app flags when its market league no longer matches these references.
-- Unique item prices and the Divine Orb exchange rate come from poe.ninja's public economy endpoints. They are market estimates, not guaranteed trade listings.
-- Rare items are shown with their actual base types when available, but are not assigned fabricated prices. Their value depends on the rolled modifiers. The budget cap compares prices for the listed uniques and calls out when the result is incomplete.
-- The tree preview highlights the active allocation from each linked PoB export against GGG's skill-tree data. The linked guide/PoB remains the source for leveling trees, item sets, and gem variants.
-- poe.ninja's supported public API is its economy API; this app does not call or scrape its private builds API.
+## Prices and sharing
 
-## Current build references
+Unique quotes and the divine-to-chaos rate come from current-league poe.ninja data. Rare and magic items generally have no reliable name-only quote, so the displayed figure is a priced subtotal. An explicit budget is rejected if that subtotal alone exceeds it; the full budget remains unverified while slots are unpriced. Without a stated budget, the result says “not specified”.
 
-- Elementalist: [Ronarray's 3.29 Ethereal Knives Ignite guide](https://mobalytics.gg/poe/builds/ignite-ethereal-knives-elementalist-build-league-starter-to-endgame), [progression PoB](https://pobb.in/eOtcfO47VWsG)
-- Necromancer: [BalorMage's 3.29 Poison SRS guide](https://www.poe-vault.com/guides/balormage-summon-raging-spirits-necromancer-build-guide), [Path of Building export](https://pobb.in/7_6IS6EVRZfT)
-- Occultist: [Ronarray's 3.29 Winter Orb guide](https://mobalytics.gg/poe/profile/ronarray/builds/3-29-winter-orb-occultist-witch-build-from-league-starter-to-ubers), [Path of Building export](https://pobb.in/8cQ3YmPIEgrg)
+Publishing uploads the validated PoB code to [pobb.in](https://pobb.in), reads the public raw code back, and compares build mechanics. A public URL appears only after this succeeds. If sharing fails, the local result and PoB import code remain available with a Retry sharing action. Sharing exposes generated gear and configuration publicly; the written prompt is kept in the local result and is not embedded in the public PoB.
+
+PoB calculation currently requires Windows and PoB's bundled `lua51.dll`. The server binds to localhost and rejects a second listener on the same port. Its API accepts requests only for the local host; changes require JSON from the local page.

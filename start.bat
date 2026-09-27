@@ -1,13 +1,18 @@
 @echo off
-setlocal
 cd /d "%~dp0"
-where node >nul 2>nul
-if errorlevel 1 (
-  echo Node.js 18 or newer is required to run this local app.
-  echo Install Node.js from https://nodejs.org/ and then run start.bat again.
-  pause
-  exit /b 1
+if defined WITCHCRAFT_PYTHON if exist "%WITCHCRAFT_PYTHON%" (
+  "%WITCHCRAFT_PYTHON%" server.py
+  goto :eof
 )
-start "" "http://127.0.0.1:4173"
-node server.js
+where py >nul 2>nul
+if %errorlevel%==0 (
+  py -3 server.py
+  goto :eof
+)
+where python >nul 2>nul
+if %errorlevel%==0 (
+  python server.py
+  goto :eof
+)
+echo Python 3 was not found. Install Python 3.10 or newer and run start.bat again.
 pause
