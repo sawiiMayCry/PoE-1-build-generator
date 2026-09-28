@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from build_generator import decode_pob, encode_pob, mechanics_fingerprint
+from build_generator import decode_pob, encode_pob, mechanics_fingerprint, validate_calculation
 from prompt_generator import generate
 from ollama_service import DEFAULT_MODEL, models
 from pob_engine import calculate_with_pob, engine_status
@@ -24,6 +24,7 @@ GENERATED = DATA / "generated"
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "4173"))
 JOBS: dict[str, dict] = {}
+MAX_FINISHED_JOBS = 50
 BUILDS: dict[str, dict] = {}
 LOCK = threading.RLock()
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
@@ -194,6 +195,11 @@ class Handler(BaseHTTPRequestHandler):
                 with LOCK:
                     if sum(job["status"] in {"queued", "running"} for job in JOBS.values()) >= 2:
                         self.reply(429, {"error": "Two generations are already running; retry shortly"}); return
+                    # Keep only the most recent finished jobs; the UI polls a job
+                    # while it runs and saved builds live on disk.
+                    finished = [key for key, job in JOBS.items() if job["status"] not in {"queued", "running"}]
+                    for key in finished[:-MAX_FINISHED_JOBS]:
+                        del JOBS[key]
                     job_id = secrets.token_hex(12)
                     JOBS[job_id] = {"id": job_id, "status": "queued", "stage": "Queued"}
                 threading.Thread(target=run_job, args=(job_id, request), daemon=True).start()
@@ -209,8 +215,10 @@ class Handler(BaseHTTPRequestHandler):
                 if mechanics_fingerprint(xml) != build["_fingerprint"]:
                     raise RuntimeError("Saved build mechanics changed; regenerate")
                 calculation = calculate_with_pob(xml, ROOT, DATA)
-                if not calculation.get("calculated"):
-                    raise RuntimeError("PoB could not revalidate the saved export")
+                failed = [check for check in validate_calculation(calculation) if not check["passed"]]
+                if failed:
+                    raise RuntimeError("Saved export no longer passes validation; regenerate. " +
+                                       "; ".join(check["reason"] for check in failed))
                 try:
                     build["shareUrl"] = publish(encode_pob(xml), decode_pob,
                                                 build["_fingerprint"], mechanics_fingerprint)

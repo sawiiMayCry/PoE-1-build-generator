@@ -124,8 +124,17 @@ def _gem_color(gem_data: str, gem) -> str | None:
 
 
 def _socket_colors(item_text: str) -> list[str]:
-    match = re.search(r"(?im)^Sockets:\s*([RGBWAD-]+)\s*$", item_text or "")
-    return match.group(1).split("-") if match else []
+    """Colours of the item's largest linked group of gem sockets.
+
+    PoB writes linked sockets joined by "-" and separate groups split by
+    spaces ("B-R-W-W-W W"). Abyssal (A) and delve (D) sockets cannot hold gems.
+    """
+    match = re.search(r"(?im)^Sockets:[ \t]*([RGBWAD]+(?:[ \t]*[- ][ \t]*[RGBWAD]+)*)[ \t]*$", item_text or "")
+    if not match:
+        return []
+    groups = [[color for color in re.split(r"\s*-\s*", group) if color in {"R", "G", "B", "W"}]
+              for group in match.group(1).split()]
+    return max(groups, key=len, default=[])
 
 
 def _colors_fit(gems, sockets, gem_data, tree_version: str) -> bool:
@@ -138,7 +147,9 @@ def _colors_fit(gems, sockets, gem_data, tree_version: str) -> bool:
     colors = [_gem_color(gem_data, gem) for gem in gems]
     if any(color is None for color in colors):
         return False
-    return all(colors.count(color) >= sockets.count(color) for color in "RGB")
+    # Each gem needs a socket of its colour; white sockets cover any shortfall.
+    shortfall = sum(max(0, colors.count(color) - sockets.count(color)) for color in "RGB")
+    return shortfall <= sockets.count("W")
 
 
 def _clean(root, label):
@@ -385,10 +396,9 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
     allowed_ascendancies = {ascendancy, secondary_name} if secondary_name else {ascendancy}
     wrong_asc = [node.get("ascendancyName") for node in asc_nodes if node.get("ascendancyName") not in allowed_ascendancies]
     paid_asc = sum(not node.get("isAscendancyStart") for node in asc_nodes)
-    normal_count = len(nodes) - len(asc_nodes)
-    paid_normal_upper = level - 1 + 24 + 2  # class start plus possible alternate start
-    check("Legal passive points", normal_count <= paid_normal_upper and paid_asc <= 8 and not wrong_asc,
-          f"{normal_count} normal nodes (limit {paid_normal_upper}); {paid_asc} ascendancy points (limit 8)")
+    # Paid points are counted by PoB after import. Raw XML includes start,
+    # granted and cluster nodes and is not a reliable paid-point total.
+    check("Ascendancy classes", not wrong_asc, f"Unexpected ascendancies: {wrong_asc}")
     _, main, _ = _main_group(root)
     gems = main.findall("Gem")
     gem_data = (context["pobHome"] / "Data" / "Gems.lua").read_text(encoding="utf-8")
@@ -445,13 +455,24 @@ def validate_calculation(stats: dict) -> list[dict]:
         {"name": "Endgame health pool", "passed": life >= 3000, "reason": f"Life plus energy shield: {life:,.0f}; minimum for this recipe: 3,000"},
         {"name": "Main skill offense", "passed": offense > 0, "reason": f"PoB calculated {offense:,.0f} DPS"},
     ]
+    points = stats.get("passives", {})
+    used, maximum = points.get("used"), points.get("maximum")
+    asc, secondary = points.get("ascendancy"), points.get("secondaryAscendancy")
+    legal_points = (all(isinstance(value, (int, float)) for value in (used, maximum, asc, secondary))
+                    and used <= maximum and 0 <= asc <= 8 and 0 <= secondary <= 8)
+    checks.append({"name": "Legal passive points", "passed": legal_points,
+                   "reason": f"PoB counts {used} paid passives (limit {maximum}); "
+                             f"{asc} primary and {secondary} secondary ascendancy points (limit 8 each)"})
     for element in ("Fire", "Cold", "Lightning"):
         value = output.get(element + "Resist")
         checks.append({"name": element + " resistance", "passed": value is not None and float(value) >= 75,
                        "reason": f"PoB reports {value}% (target: 75%)"})
-    for attr in ("Str", "Dex", "Int"):
-        required, actual = output.get("Req" + attr), output.get(attr)
-        checks.append({"name": attr + " requirements", "passed": actual is not None and required is not None and actual >= required,
+    # PoB only emits Req<attr> when a requirement is above zero; attribute
+    # requirement immunity and Omniscience (which moves them to ReqOmni) omit it.
+    attributes = ("Str", "Dex", "Int") + (("Omni",) if output.get("ReqOmni") is not None else ())
+    for attr in attributes:
+        required, actual = output.get("Req" + attr, 0), output.get(attr)
+        checks.append({"name": attr + " requirements", "passed": actual is not None and actual >= required,
                        "reason": f"{actual} available; {required} required"})
     return checks
 
