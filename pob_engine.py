@@ -78,7 +78,7 @@ build.calcsTab:BuildOutput()
 local output = build.calcsTab.mainOutput
 if type(output) ~= "table" then error("PoB did not return calculated build stats") end
 local stats = {}
-for _, key in ipairs({"Life", "EnergyShield", "Armour", "Evasion", "FullDPS", "FullDotDPS", "CombinedDPS", "TotalDPS", "TotalDotDPS", "IgniteDPS", "WithIgniteDPS", "FireResist", "ColdResist", "LightningResist", "ChaosResist", "Str", "Dex", "Int", "ReqStr", "ReqDex", "ReqInt"}) do
+for _, key in ipairs({"Life", "EnergyShield", "Armour", "Evasion", "FullDPS", "FullDotDPS", "CombinedDPS", "TotalDPS", "TotalDotDPS", "IgniteDPS", "WithIgniteDPS", "FireResist", "ColdResist", "LightningResist", "ChaosResist", "Str", "Dex", "Int", "Omni", "ReqStr", "ReqDex", "ReqInt", "ReqOmni"}) do
   if type(output[key]) == "number" then stats[key] = output[key] end
 end
 if next(stats) == nil then error("PoB returned an empty stat table") end

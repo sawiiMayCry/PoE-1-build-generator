@@ -124,8 +124,17 @@ def _gem_color(gem_data: str, gem) -> str | None:
 
 
 def _socket_colors(item_text: str) -> list[str]:
-    match = re.search(r"(?im)^Sockets:\s*([RGBWAD-]+)\s*$", item_text or "")
-    return match.group(1).split("-") if match else []
+    """Colours of the item's largest linked group of gem sockets.
+
+    PoB writes linked sockets joined by "-" and separate groups split by
+    spaces ("B-R-W-W-W W"). Abyssal (A) and delve (D) sockets cannot hold gems.
+    """
+    match = re.search(r"(?im)^Sockets:[ \t]*([RGBWAD]+(?:[ \t]*[- ][ \t]*[RGBWAD]+)*)[ \t]*$", item_text or "")
+    if not match:
+        return []
+    groups = [[color for color in re.split(r"\s*-\s*", group) if color in {"R", "G", "B", "W"}]
+              for group in match.group(1).split()]
+    return max(groups, key=len, default=[])
 
 
 def _colors_fit(gems, sockets, gem_data, tree_version: str) -> bool:
@@ -138,7 +147,9 @@ def _colors_fit(gems, sockets, gem_data, tree_version: str) -> bool:
     colors = [_gem_color(gem_data, gem) for gem in gems]
     if any(color is None for color in colors):
         return False
-    return all(colors.count(color) >= sockets.count(color) for color in "RGB")
+    # Each gem needs a socket of its colour; white sockets cover any shortfall.
+    shortfall = sum(max(0, colors.count(color) - sockets.count(color)) for color in "RGB")
+    return shortfall <= sockets.count("W")
 
 
 def _clean(root, label):
@@ -449,9 +460,12 @@ def validate_calculation(stats: dict) -> list[dict]:
         value = output.get(element + "Resist")
         checks.append({"name": element + " resistance", "passed": value is not None and float(value) >= 75,
                        "reason": f"PoB reports {value}% (target: 75%)"})
-    for attr in ("Str", "Dex", "Int"):
-        required, actual = output.get("Req" + attr), output.get(attr)
-        checks.append({"name": attr + " requirements", "passed": actual is not None and required is not None and actual >= required,
+    # PoB only emits Req<attr> when a requirement is above zero; attribute
+    # requirement immunity and Omniscience (which moves them to ReqOmni) omit it.
+    attributes = ("Str", "Dex", "Int") + (("Omni",) if output.get("ReqOmni") is not None else ())
+    for attr in attributes:
+        required, actual = output.get("Req" + attr, 0), output.get(attr)
+        checks.append({"name": attr + " requirements", "passed": actual is not None and actual >= required,
                        "reason": f"{actual} available; {required} required"})
     return checks
 
