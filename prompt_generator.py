@@ -211,34 +211,70 @@ def _tree_options(root: ET.Element, context: dict) -> list[dict]:
     options = []
     for old in allocated:
         node = nodes.get(old, {})
-        if (not node or old in mastered or node.get("ascendancyName") or node.get("isMastery")
+        if (not node or not node.get("stats") or old in mastered or node.get("ascendancyName") or node.get("isMastery")
                 or node.get("isKeystone") or "Jewel Socket" in node.get("name", "")):
+            continue
+        # These leaves often exist to meet a hard equipment or resistance
+        # requirement. Do not offer to remove them as a generic damage swap.
+        if re.search(r"(?i)resistan|dexterity|strength|intelligence|all attributes|reservation",
+                     " ".join(node.get("stats", []))):
             continue
         parent = _neighbors(old, nodes) & selected
         if len(parent) != 1:
             continue
         for new in sorted(_neighbors(next(iter(parent)), nodes) - selected):
             replacement = nodes.get(new, {})
-            if (not replacement or replacement.get("ascendancyName") or replacement.get("isMastery")
+            if (not replacement or not replacement.get("stats") or replacement.get("ascendancyName") or replacement.get("isMastery")
                     or replacement.get("isKeystone") or "Jewel Socket" in replacement.get("name", "")):
                 continue
             options.append({"id": f"T{len(options)+1}", "kind": "swap", "from": old, "to": new,
-                            "label": f"{node.get('name')} → {replacement.get('name')}"})
-    normal_count = sum(not nodes.get(value, {}).get("ascendancyName") for value in allocated)
-    level = int(root.find("Build").get("level", "0"))
-    if normal_count < level - 1 + 24 + 2:
+                            "label": f"{node.get('name')} → {replacement.get('name')}",
+                            "stats": replacement.get("stats", [])})
+    points = context.get("passiveCounts", {})
+    if points and points["used"] < points["maximum"]:
         available = set()
         for old in allocated:
             available.update(_neighbors(old, nodes) - selected)
         for new in sorted(available):
             node = nodes.get(new, {})
-            if (not node or node.get("ascendancyName") or node.get("isMastery")
+            if (not node or not node.get("stats") or node.get("ascendancyName") or node.get("isMastery")
                     or node.get("isKeystone") or "Jewel Socket" in node.get("name", "")):
                 continue
             options.append({"id": f"T{len(options)+1}", "kind": "add", "to": new,
-                            "label": f"Allocate {node.get('name')}"})
+                            "label": f"Allocate {node.get('name')}", "stats": node.get("stats", [])})
     # Return a bounded, diverse set of actual current-tree alternatives.
-    return options[:24]
+    return sorted(options, key=lambda entry: entry["kind"] != "add")[:24]
+
+
+def _target_level(prompt: str, source_level: int, required_level: int) -> int:
+    explicit = re.search(r"(?i)\b(?:level|lvl)\s*(\d{1,3})\b", prompt)
+    # With no requested level, allow one new point for the model's tree plan.
+    target = int(explicit.group(1)) if explicit else max(source_level, min(100, required_level + 1))
+    if not 1 <= target <= 100:
+        raise PatternUnusable("The source passive tree requires a character above level 100.")
+    if target < required_level:
+        raise PatternUnusable(f"This passive tree requires level {required_level}, above your requested level {target}.")
+    return target
+
+
+def _prepare_pattern(pattern: dict, roots: dict, prompt: str, context: dict,
+                     app_root: Path, data_root: Path, stage) -> tuple[dict, dict]:
+    stage("Checking the source's paid passive points with Path of Building")
+    source = copy.deepcopy(roots[pattern["source"]])
+    build = source.find("Build")
+    build.set("mainSocketGroup", str(pattern["group"]))
+    build.set("characterLevelAutoMode", "false")
+    baseline = calculate_with_pob(ET.tostring(source, encoding="unicode"), app_root, data_root)
+    points = baseline.get("passives")
+    if not points:
+        raise RuntimeError("PoB did not return the source's passive-point count.")
+    source_level = int(build.get("level", "0"))
+    target = _target_level(prompt, source_level, int(points["requiredLevel"]))
+    build.set("level", str(target))
+    build.set("characterLevelAutoMode", "false")
+    roots[pattern["source"]] = source
+    counts = {**points, "maximum": points["maximum"] + target - source_level}
+    return {**pattern, "level": target, "sourceLevel": source_level}, {**context, "passiveCounts": counts}
 
 
 def _donor_options(pattern: dict, roots: dict[str, ET.Element]) -> list[dict]:
@@ -265,6 +301,10 @@ def _support_options(pattern: dict, roots: dict[str, ET.Element]) -> tuple[list[
     active = _active_set(core, "Skills", "SkillSet", "activeSkillSet")
     group = active.findall("Skill")[pattern["group"] - 1]
     used = {gem.get("gemId") for gem in group.findall("Gem")}
+    main_names = {gem.get("nameSpec") for gem in group.findall("Gem")}
+    ignite_core = "Burning Damage" in main_names and "Combustion" in main_names
+    ignite_supports = {"Unbound Ailments", "Deadly Ailments", "Burning Damage", "Swift Affliction",
+                       "Combustion", "Cruelty", "Ignite Proliferation", "Efficacy", "Empower", "Lifetap"}
     zombie_supports = {"Minion Life", "Feeding Frenzy", "Multistrike", "Meat Shield",
                        "Melee Physical Damage", "Ruthless", "Empower"}
     choices, gems = [], {}
@@ -284,6 +324,8 @@ def _support_options(pattern: dict, roots: dict[str, ET.Element]) -> tuple[list[
                     if not _support(gem) or not gem_id or gem_id in used or gem_id in gems:
                         continue
                     if pattern.get("replaceSkill") and gem.get("nameSpec") not in zombie_supports:
+                        continue
+                    if ignite_core and gem.get("nameSpec") not in ignite_supports:
                         continue
                     gems[gem_id] = gem
                     choices.append({"id": gem_id, "name": gem.get("nameSpec"), "source": source_id})
@@ -422,6 +464,9 @@ def _construct(pattern: dict, action: dict, tree_options: list[dict],
     return xml, {"changedSlots": changed, "changedMainLinks": [f"{old_gem.get('nameSpec')} → {new_gem.get('nameSpec')}"],
                  "treeChange": tree_choice["label"], "method": "Local-model component plan from current PoB and official tree data",
                  "source": pattern["source"], "donor": donor_id,
+                 "levelChange": (f"Target level {pattern['level']} fits the source's planned tree "
+                                  f"(exported character level {pattern['sourceLevel']})."
+                                  if pattern.get("sourceLevel", pattern["level"]) != pattern["level"] else ""),
                  "modelReason": (str(action.get("reason", ""))[:350] if changed else
                                  "The local model chose the skill, passive, and support. Gear swaps were omitted "
                                  "after validation found a failed requirement.")}
@@ -444,6 +489,8 @@ def _validate_candidate(pattern: dict, action: dict, tree_options: list[dict], s
     checks += validate_calculation(calculation)
     if not all(check["passed"] for check in checks):
         raise ValueError("; ".join(check["name"] + ": " + check["reason"] for check in checks if not check["passed"]))
+    points = calculation["passives"]
+    details["ascendancyPoints"] = points["ascendancy"] + points["secondaryAscendancy"]
     stage(f"Pricing equipped items in {context['league']}")
     price = quote(details["gear"], market, cap)
     explicit_budget = _budget_from_prompt(prompt, market["divineChaos"]) is not None
@@ -476,9 +523,10 @@ def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
         try:
             available_patterns = [entry for entry in patterns if entry["id"] not in excluded_patterns]
             pattern, cap, high_plan = _choose_pattern(prompt, model, available_patterns, context, market, feedback)
+            pattern, plan_context = _prepare_pattern(pattern, roots, prompt, context, app_root, data_root, stage)
             stage("Asking the local model to choose passives, gems and equipment")
             action, tree_options, support_gems = _choose_actions(prompt, model, pattern, roots[pattern["source"]],
-                                                                  roots, context, feedback)
+                                                                  roots, plan_context, feedback)
             # Fall back from the model's gear choice to flask swaps only, then
             # to the source gear, before giving up on this pattern.
             flasks = [slot for slot in action["gear_slots"] if slot.startswith("Flask ")]
@@ -493,7 +541,7 @@ def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
                     if candidate is not action:
                         stage("Retrying with fewer equipment swaps after a failed check")
                     xml, recipe, checks, details, calculation, price = _validate_candidate(
-                        pattern, candidate, tree_options, support_gems, roots, context, market,
+                        pattern, candidate, tree_options, support_gems, roots, plan_context, market,
                         cap, prompt, app_root, data_root, stage)
                     break
                 except Exception as candidate_error:

@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from build_generator import decode_pob, encode_pob, mechanics_fingerprint
+from build_generator import decode_pob, encode_pob, mechanics_fingerprint, validate_calculation
 from prompt_generator import generate
 from ollama_service import DEFAULT_MODEL, models
 from pob_engine import calculate_with_pob, engine_status
@@ -215,8 +215,10 @@ class Handler(BaseHTTPRequestHandler):
                 if mechanics_fingerprint(xml) != build["_fingerprint"]:
                     raise RuntimeError("Saved build mechanics changed; regenerate")
                 calculation = calculate_with_pob(xml, ROOT, DATA)
-                if not calculation.get("calculated"):
-                    raise RuntimeError("PoB could not revalidate the saved export")
+                failed = [check for check in validate_calculation(calculation) if not check["passed"]]
+                if failed:
+                    raise RuntimeError("Saved export no longer passes validation; regenerate. " +
+                                       "; ".join(check["reason"] for check in failed))
                 try:
                     build["shareUrl"] = publish(encode_pob(xml), decode_pob,
                                                 build["_fingerprint"], mechanics_fingerprint)

@@ -396,10 +396,9 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
     allowed_ascendancies = {ascendancy, secondary_name} if secondary_name else {ascendancy}
     wrong_asc = [node.get("ascendancyName") for node in asc_nodes if node.get("ascendancyName") not in allowed_ascendancies]
     paid_asc = sum(not node.get("isAscendancyStart") for node in asc_nodes)
-    normal_count = len(nodes) - len(asc_nodes)
-    paid_normal_upper = level - 1 + 24 + 2  # class start plus possible alternate start
-    check("Legal passive points", normal_count <= paid_normal_upper and paid_asc <= 8 and not wrong_asc,
-          f"{normal_count} normal nodes (limit {paid_normal_upper}); {paid_asc} ascendancy points (limit 8)")
+    # Paid points are counted by PoB after import. Raw XML includes start,
+    # granted and cluster nodes and is not a reliable paid-point total.
+    check("Ascendancy classes", not wrong_asc, f"Unexpected ascendancies: {wrong_asc}")
     _, main, _ = _main_group(root)
     gems = main.findall("Gem")
     gem_data = (context["pobHome"] / "Data" / "Gems.lua").read_text(encoding="utf-8")
@@ -456,6 +455,14 @@ def validate_calculation(stats: dict) -> list[dict]:
         {"name": "Endgame health pool", "passed": life >= 3000, "reason": f"Life plus energy shield: {life:,.0f}; minimum for this recipe: 3,000"},
         {"name": "Main skill offense", "passed": offense > 0, "reason": f"PoB calculated {offense:,.0f} DPS"},
     ]
+    points = stats.get("passives", {})
+    used, maximum = points.get("used"), points.get("maximum")
+    asc, secondary = points.get("ascendancy"), points.get("secondaryAscendancy")
+    legal_points = (all(isinstance(value, (int, float)) for value in (used, maximum, asc, secondary))
+                    and used <= maximum and 0 <= asc <= 8 and 0 <= secondary <= 8)
+    checks.append({"name": "Legal passive points", "passed": legal_points,
+                   "reason": f"PoB counts {used} paid passives (limit {maximum}); "
+                             f"{asc} primary and {secondary} secondary ascendancy points (limit 8 each)"})
     for element in ("Fire", "Cold", "Lightning"):
         value = output.get(element + "Resist")
         checks.append({"name": element + " resistance", "passed": value is not None and float(value) >= 75,

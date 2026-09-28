@@ -106,6 +106,7 @@ function render(build) {
     el("p", "", `Main link: ${build.gems.join(" · ")}`),
     el("p", "muted", `Tree adjustment: ${build.recipe.treeChange}. Support: ${build.recipe.changedMainLinks.join(", ")}. ${build.recipe.changedSlots.length ? `Changed gear: ${build.recipe.changedSlots.join(", ")}.` : "Source gear kept after validation."}`),
     el("p", "muted", build.recipe.modelReason || "PoB calculates the resulting export."));
+  if (build.recipe.levelChange) plan.append(el("p", "muted", build.recipe.levelChange));
   const checks = el("details", "checks"), list = el("ul");
   checks.append(el("summary", "", `Validation checks · ${build.validation.filter(v => v.passed).length}/${build.validation.length} passed`));
   for (const check of build.validation) list.append(el("li", "", `${check.passed ? "✓" : "✗"} ${check.name}: ${check.reason}`));

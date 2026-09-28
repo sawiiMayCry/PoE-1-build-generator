@@ -16,6 +16,8 @@ The generator assembles real PoB components from cached current-tree Witch refer
 
 Each candidate must use the current official passive tree and installed PoB definitions, fit its main skill into equipped sockets, preserve a complete gear set, and stay within passive and ascendancy limits. Witchcraft calculates the exact generated XML with PoB and checks health, elemental resistances, attribute requirements, and nonzero offense. Invalid plans are retried with failure feedback. These checks are a minimum viability gate, not a guarantee of optimized gameplay.
 
+Passive limits use PoB's paid-point count, including bandit and secondary ascendancy effects. Some source exports contain a planned tree beyond their saved character level. Without a level in the prompt, the generator targets a level that supports that tree and one new passive choice, up to level 100, and shows the adjustment. An explicit `level 90` constraint is respected; a tree that needs a higher level is rejected. Resistance and attribute passives are preserved, and ignite setups receive compatible support choices.
+
 The app reads the active PoE 1 trade league from [poe.ninja](https://poe.ninja/docs/api), passive nodes from [Grinding Gear Games](https://github.com/grindinggear/skilltree-export), and local game definitions from PoB Community. It stops if required current data is unavailable.
 
 ## Prices and sharing

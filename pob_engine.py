@@ -83,7 +83,12 @@ for _, key in ipairs({"Life", "EnergyShield", "Armour", "Evasion", "FullDPS", "F
 end
 if next(stats) == nil then error("PoB returned an empty stat table") end
 local encoder = require("dkjson")
-local payload = assert(encoder.encode({calculated = true, stats = stats, version = launch.versionNumber}))
+local used, ascUsed, secondaryAscUsed = build.spec:CountAllocNodes()
+local extra = output.ExtraPoints or 0
+local passives = {used = used, maximum = build.characterLevel - 1 + 23 + extra,
+  requiredLevel = used + 1 - 23 - extra, ascendancy = ascUsed - secondaryAscUsed,
+  secondaryAscendancy = secondaryAscUsed}
+local payload = assert(encoder.encode({calculated = true, stats = stats, passives = passives, version = launch.versionNumber}))
 local result = assert(io.open(assert(os.getenv("WITCHCRAFT_OUTPUT_JSON")), "wb"))
 result:write(payload)
 result:close()
