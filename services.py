@@ -132,7 +132,19 @@ def publish(code: str, decoder, expected_fingerprint: str, fingerprint) -> str:
         raw = fetch("https://pobb.in/pob/", data=code.encode("ascii"), timeout=30,
                     headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "text/plain"})
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"pobb.in rejected the export (HTTP {exc.code}); retry sharing later") from exc
+        detail = exc.read(1024).decode("utf-8", errors="replace").strip()
+        if detail.startswith("{"):
+            try:
+                error = json.loads(detail)
+                detail = error.get("message") or error.get("error") or ""
+            except (ValueError, AttributeError):
+                detail = ""
+        if not isinstance(detail, str) or "<" in detail:
+            detail = ""
+        detail = re.sub(r"\s+", " ", detail)[:240]
+        message = (f"pobb.in rejected the build format (HTTP {exc.code})" if exc.code == 400 else
+                   f"pobb.in rejected the export (HTTP {exc.code}); retry sharing later")
+        raise RuntimeError(message + (": " + detail if detail else "")) from exc
     value = raw.decode("utf-8", errors="replace").strip()
     match = re.fullmatch(r"(?:https?://(?:www\.)?pobb\.in/)?([A-Za-z0-9_-]{4,32})/?", value)
     if not match:
