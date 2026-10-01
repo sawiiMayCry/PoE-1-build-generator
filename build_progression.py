@@ -7,8 +7,8 @@ import xml.etree.ElementTree as ET
 
 from build_assembly import assemble
 from build_generator import _item_parts, _main_group, offense_value
-from generation_data import rare_templates, solve_suffixes
-from passive_search import graph, heuristic, paths_from
+from generation_data import base_required_level, rare_templates, solve_suffixes
+from passive_search import candidate_minion_count, graph, heuristic, paths_from
 
 
 # Checkpoints are after each act's passive quests, with kill-all bandits.
@@ -106,18 +106,22 @@ def add_flasks(root, data, level: int):
     item_set = next(entry for entry in equipment.findall("ItemSet") if entry.get("id") == active)
     next_id = max((int(item.get("id")) for item in equipment.findall("Item")), default=0)
     for index, kind in enumerate(("Life", "Mana", "Quicksilver", "Granite", "Quartz"), 1):
+        slot_name = f"Flask {index}"
+        if any(slot.get("name") == slot_name for slot in item_set.findall("Slot")):
+            continue
         choices = [(name, base) for name, base in data.bases.items() if base["type"] == "Flask"
-                   and (base.get("subType") == kind if kind in {"Life", "Mana"} else name == kind + " Flask")
-                   and base.get("req", {}).get("level", 1) <= level]
+                   and (name.endswith(" Life Flask") if kind == "Life" else
+                        name.endswith(" Mana Flask") if kind == "Mana" else name == kind + " Flask")
+                   and base_required_level(base) <= level]
         if not choices:
             choices = [(name, base) for name, base in data.bases.items() if base["type"] == "Flask"
-                       and base.get("subType") == "Life" and base.get("req", {}).get("level", 1) <= level]
+                       and name.endswith(" Life Flask") and base_required_level(base) <= level]
         if not choices:
             raise ValueError("Installed flask definitions are missing")
-        name, base = max(choices, key=lambda row: (row[1].get("req", {}).get("level", 1), row[0]))
+        name, base = max(choices, key=lambda row: (base_required_level(row[1]), row[0]))
         next_id += 1
         ET.SubElement(equipment, "Item", id=str(next_id)).text = f"Rarity: NORMAL\n{name}\nQuality: 0"
-        ET.SubElement(item_set, "Slot", name=f"Flask {index}", itemId=str(next_id), active="false")
+        ET.SubElement(item_set, "Slot", name=slot_name, itemId=str(next_id), active="false")
 
 
 def combine_loadouts(documents: list[str], phases: list[dict], notes: str) -> str:
@@ -191,7 +195,10 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
                          for entry in data.gem(gem.get("nameSpec"))["levels"])
                      for gem in root.findall("./Skills/SkillSet/Skill/Gem") if gem.get("gemId"))
     ids = {item.get("id"): item for item in root.findall("./Items/Item")}
-    equipment = root.find("./Items/ItemSet")
+    item_container = root.find("Items")
+    active_item_set = item_container.get("activeItemSet") if item_container is not None else None
+    equipment = next((entry for entry in root.findall("./Items/ItemSet")
+                      if entry.get("id") == active_item_set), None)
     valid_items = True
     for slot in equipment.findall("Slot"):
         item = ids.get(slot.get("itemId"))
@@ -200,11 +207,15 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
                 valid_items = False
             continue
         _, _, base = _item_parts(item.text)
-        valid_items = valid_items and base in data.bases and data.bases[base].get("req", {}).get("level", 1) <= phase["level"]
+        valid_items = valid_items and base in data.bases and base_required_level(data.bases[base]) <= phase["level"]
     _, main, _ = _main_group(root)
     links = len(main.findall("Gem"))
     counts = {}
-    for group in root.findall("./Skills/SkillSet/Skill"):
+    skill_container = root.find("Skills")
+    active_skill_set = skill_container.get("activeSkillSet") if skill_container is not None else None
+    active_skills = next((entry for entry in root.findall("./Skills/SkillSet")
+                          if entry.get("id") == active_skill_set), None)
+    for group in active_skills.findall("Skill") if active_skills is not None else []:
         socketed = sum(bool(gem.get("gemId")) for gem in group.findall("Gem"))
         if socketed:
             counts[group.get("slot")] = counts.get(group.get("slot"), 0) + socketed
@@ -215,6 +226,8 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
         text = ids[entry.get("itemId")].text
         match = re.search(r"(?m)^Sockets: ([RGBW -]+)$", text)
         return sum(color in "RGBW" for color in match[1]) if match else 0
+    available_sockets = {slot: socket_count(slot) for slot in counts}
+    socket_ok = links <= phase["links"] and all(count <= available_sockets[slot] for slot, count in counts.items())
     connected = True
     official = context["tree"]["nodes"]
     for ascendancy in (False, True):
@@ -237,14 +250,18 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
         ("Connected stage tree", connected),
         ("Stage gem levels", valid_gems),
         ("Stage equipment levels", valid_items),
-        ("Stage sockets", links <= phase["links"] and all(count <= socket_count(slot) for slot, count in counts.items())),
+        ("Stage sockets", socket_ok,
+         f"{phase['title']}; main link {links}/{phase['links']}; groups {counts}; "
+         f"available sockets {available_sockets}"),
         ("Stage attributes", all(output.get(attr, 0) >= output.get("Req" + attr, 0) for attr in ("Str", "Dex", "Int"))),
         ("Stage resistances", all(output.get(element + "Resist", -60) >= phase["resistanceTarget"] for element in ("Fire", "Cold", "Lightning"))),
         ("Stage mana", output.get("ManaUnreserved", 0) >= output.get("ManaCost", 0)),
         ("Stage health pool", output.get("Life", 0) + output.get("EnergyShield", 0) >=
-         (3000 if phase["level"] >= 68 else 20 * phase["level"])),
+         (3000 if phase["act"] == 12 else 30 * phase["level"] if phase["act"] == 11 else
+          20 * phase["level"])),
     ]
-    return [{"name": name, "passed": bool(passed), "reason": phase["title"]} for name, passed in facts]
+    return [{"name": fact[0], "passed": bool(fact[1]),
+             "reason": fact[2] if len(fact) > 2 else phase["title"]} for fact in facts]
 
 
 def build_notes(spec: dict, stages: list[dict]) -> str:
@@ -292,7 +309,11 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
     asc = final_nodes - regular
     start = next(key for key in regular if official[key].get("classStartIndex") == 3)
     asc_start = next(key for key in asc if official[key].get("isAscendancyStart"))
-    order = connected_order(official, regular, start, spec, masteries)
+    # Endgame focus should not starve campaign checkpoints of life and
+    # resistance nodes. Keep the exact final allocation, but order its legal
+    # prefix defensively so the level-75 and act loadouts remain survivable.
+    progression_spec = {**spec, "focus": "defense"}
+    order = connected_order(official, regular, start, progression_spec, masteries)
     asc_order = ascendancy_order(official, asc, asc_start, spec)
     final_supports = [gem.get("nameSpec") for gem in _main_group(root)[1].findall("Gem")][1:]
     phases, documents, summaries = milestones(spec["level"]), [], []
@@ -344,8 +365,11 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
                 gem_levels[name] = gem_level(data.gem(name), phase["level"], 19 if phase["act"] == 11 else 20)
             for attempt in range(5):
                 calc = worker.request("calculate", xml=render())
-                if main_skill == "Raise Zombie" and calc["stats"].get("ActiveMinionLimit", 0) > 0:
-                    phase_spec["minionCount"] = int(calc["stats"]["ActiveMinionLimit"])
+                estimated_population = candidate_minion_count(calc["stats"], phase_spec)
+                if (estimated_population is not None and
+                        estimated_population != phase_spec.get("minionCount")):
+                    phase_spec["minionCount"] = estimated_population
+                    continue
                 if solve_suffixes(items, data, calc["stats"], resistance_target=phase["resistanceTarget"]):
                     continue
                 if calc["stats"].get("ManaUnreserved", 0) < calc["stats"].get("ManaCost", 0):
@@ -366,7 +390,7 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             calc = worker.request("calculate", xml=xml)
             # Verify eligible tiers/groups as well as PoB's resulting requirements.
             for item in items:
-                assert item.definition.get("req", {}).get("level", 1) <= phase["level"]
+                assert base_required_level(item.definition) <= phase["level"]
                 probe = type(item)(item.slot, item.base, item.definition, item_level=item.item_level)
                 for mod in item.mods:
                     if not probe.can_add(mod):
@@ -393,6 +417,9 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
         previous_skill, previous_ascendancy = main_skill, phase["ascendancyPoints"]
         export = worker.request("export", xml=xml)
         documents.append(export["xml"])
+        # PoB's first save materializes default combat placeholders. Score and
+        # summarize the saved stage that will actually be merged/shared.
+        calc = worker.request("calculate", xml=export["xml"])
         gear = []
         for item in document.findall("./Items/Item"):
             _, _, base = _item_parts(item.text)
@@ -405,6 +432,7 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
                           "gemLevels": actual_levels, "gear": gear, "stats": calc["stats"], "validation": checks,
                           "passives": calc["passives"]["used"], "passiveBudget": phase["level"] - 1 + phase["questPoints"] +
                           max(0, calc["stats"].get("ExtraPoints", 1) - 1),
+                          "_calculation": calc,
                           "instructions": instructions})
     xml = combine_loadouts(documents, phases, build_notes(spec, summaries))
     loadouts = worker.request("loadouts", xml=xml)["loadouts"]
@@ -413,7 +441,27 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
     # Exercise the merged file as well; item IDs and active set associations
     # must preserve every previously calculated stage, not only Endgame.
     for index, summary in enumerate(summaries, 1):
-        calc = worker.request("calculate", xml=select_stage(xml, index, summary["level"]))
+        selected_xml = select_stage(xml, index, summary["level"])
+        calc = worker.request("calculate", xml=selected_xml)
         if calc["stats"] != summary["stats"] or calc["passives"]["used"] != summary["passives"]:
-            raise ValueError("Merged loadout changed " + summary["title"])
+            changed = {key: {"stage": summary["stats"].get(key), "merged": calc["stats"].get(key)}
+                       for key in set(summary["stats"]) | set(calc["stats"])
+                       if summary["stats"].get(key) != calc["stats"].get(key)}
+            merged_checks = stage_checks(selected_xml, summary, calc, data, context)
+            failures = [entry["name"] for entry in merged_checks if not entry["passed"]]
+            if failures:
+                raise ValueError("Merged loadout made " + summary["title"] +
+                                 " invalid: " + ", ".join(
+                                     entry["name"] + ": " + entry["reason"]
+                                     for entry in merged_checks if not entry["passed"]))
+            # Use the actual merged loadout's PoB calculation as authoritative;
+            # configurations can materialize default combat placeholders only
+            # when the named loadouts are combined.
+            summary["mergeStatChanges"] = changed
+            summary["stats"] = calc["stats"]
+            summary["passives"] = calc["passives"]["used"]
+            summary["passiveBudget"] = (summary["level"] - 1 + summary["questPoints"] +
+                                         max(0, calc["stats"].get("ExtraPoints", 1) - 1))
+            summary["validation"] = merged_checks
+            summary["_calculation"] = calc
     return xml, summaries

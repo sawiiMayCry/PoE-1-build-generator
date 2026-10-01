@@ -6,8 +6,9 @@ local statKeys = {"Life", "EnergyShield", "Armour", "Evasion", "FullDPS", "FullD
   "CombinedDPS", "TotalDPS", "TotalDotDPS", "IgniteDPS", "WithIgniteDPS",
   "FireResist", "ColdResist", "LightningResist", "ChaosResist", "Str", "Dex", "Int",
   "Omni", "ReqStr", "ReqDex", "ReqInt", "ReqOmni", "ExtraPoints", "Mana",
-  "ManaUnreserved", "ManaUnreservedPercent", "LifeUnreserved", "LifeUnreservedPercent",
-  "TotalEHP", "ManaCost", "ManaRegen", "Speed", "HitChance", "ActiveMinionLimit"}
+  "ManaUnreserved", "ManaUnreservedPercent", "LifeUnreserved", "LifeUnreservedPercent", "Duration",
+  "TotalEHP", "ManaCost", "ManaRegen", "LifeCost", "LifeRegenRecovery",
+  "Speed", "HitChance", "ActiveMinionLimit"}
 
 local function stats(output)
   local result = {}
@@ -18,7 +19,10 @@ local function stats(output)
   return result
 end
 
-local function load(xml)
+local function load(xml, reset)
+  -- Drop the previous build object before calculations; PoB can otherwise
+  -- retain selected-spec state when requests arrive in a different order.
+  if reset then newBuild() end
   loadBuildFromXML(assert(xml), "Witchcraft generated candidate")
   runCallback("OnFrame")
   assert(build.calcsTab, "PoB did not load candidate")
@@ -35,7 +39,7 @@ local function calculation()
 end
 
 local function metadata()
-  local gems, bases, mods = {}, {}, {}
+  local gems, bases, mods, jewelMods = {}, {}, {}, {}
   for id, gem in pairs(data.gems) do
     local levels = {}
     for level = 1, gem.naturalMaxLevel or 20 do
@@ -67,16 +71,85 @@ local function metadata()
     mods[#mods + 1] = {id = id, kind = mod.type, group = mod.group, level = mod.level,
       weightKey = mod.weightKey, weightVal = mod.weightVal, lines = lines}
   end
-  return {gems = gems, bases = bases, mods = mods}
+  for id, mod in pairs(data.itemMods.Jewel) do
+    local lines = {}
+    for _, line in ipairs(mod) do if type(line) == "string" then lines[#lines + 1] = line end end
+    jewelMods[#jewelMods + 1] = {id = id, kind = mod.type, group = mod.group, level = mod.level,
+      weightKey = mod.weightKey, weightVal = mod.weightVal, lines = lines}
+  end
+  return {gems = gems, bases = bases, mods = mods, jewelMods = jewelMods}
+end
+
+local function uniqueMetadata()
+  local result = {}
+  for category, list in pairsSortByKey(data.uniques) do
+    if type(list) == "table" then
+      for _, raw in ipairs(list) do
+        if type(raw) == "string" then
+          local item = new("Item", raw)
+          if item.base then
+            item:NormaliseVariantSelections()
+            item:BuildAndParseRaw()
+            if item.rarity == "UNIQUE" then
+              result[#result + 1] = {name = item.title or item.name, base = item.baseName,
+                type = item.base.type, subType = item.base.subType, raw = item:BuildRaw(),
+                uniqueID = item.uniqueID, selectedVersion = item.selectedVersion,
+                selectedVersionLabel = item.versionList and item.versionList[item.selectedVersion],
+                versionList = item.versionList, selectedVariant = item.variant,
+                selectedVariantLabel = item.variantList and item.variantList[item.variant],
+                variantList = item.variantList, selectedVariantGroups = item.variantGroupSelections,
+                requirements = item.requirements, sockets = item.sockets,
+                classRestriction = item.classRestriction, foulborn = item.foulborn,
+                unreleased = item.unreleased, category = category}
+            end
+          end
+        end
+      end
+    end
+  end
+  table.sort(result, function(a, b)
+    if a.name == b.name then return a.base < b.base end
+    return a.name < b.name
+  end)
+  return {items = result}
+end
+
+local function treeMetadata()
+  newBuild()
+  local tree = assert(build.spec.tree)
+  local result, effects = {}, {}
+  for id, node in pairs(tree.nodes or {}) do
+    if node.group then
+      local links = {}
+      for _, linked in ipairs(node.linkedId or {}) do links[#links + 1] = tostring(linked) end
+      local masteryIds = {}
+      for _, mastery in ipairs(node.masteryEffects or {}) do
+        local effectId = type(mastery) == "table" and mastery.effect or mastery
+        if effectId then
+          masteryIds[#masteryIds + 1] = tonumber(effectId)
+          if type(mastery) == "table" then
+            effects[tostring(effectId)] = {name = mastery.name, stats = mastery.stats}
+          end
+        end
+      end
+      result[tostring(id)] = {name = node.name, links = links, masteryEffects = masteryIds,
+        isJewelSocket = node.isJewelSocket or false, isMastery = node.type == "Mastery",
+        isProxy = node.isProxy or false, isBloodline = node.isBloodline or false,
+        ascendancyName = node.ascendancyName}
+    end
+  end
+  return {nodes = result, masteryEffects = effects, version = build.spec.treeVersion}
 end
 
 local function handle(request)
   assert(request.operation == "metadata" or request.operation == "calculate" or request.operation == "supports"
     or request.operation == "nodes" or request.operation == "supportScores" or request.operation == "export"
-    or request.operation == "loadouts",
+    or request.operation == "loadouts" or request.operation == "uniques" or request.operation == "treeMetadata",
     "Unknown worker operation")
   if request.operation == "metadata" then return metadata() end
-  load(request.xml)
+  if request.operation == "uniques" then return uniqueMetadata() end
+  if request.operation == "treeMetadata" then return treeMetadata() end
+  load(request.xml, request.operation ~= "loadouts")
   if request.operation == "loadouts" then
     build:SyncLoadouts()
     return {loadouts = build.controls.buildLoadouts.list}

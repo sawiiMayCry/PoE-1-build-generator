@@ -28,6 +28,16 @@ def eligible(mod: dict, base: dict, item_level: int = 80) -> bool:
     return False
 
 
+def base_required_level(base: dict) -> int:
+    requirements = base.get("req", {})
+    if isinstance(requirements, dict):
+        return int(requirements.get("level", 1) or 1)
+    if isinstance(requirements, (list, tuple)):
+        # Older PoB snapshots encode requirements as [str, dex, int, level].
+        return int(requirements[3]) if len(requirements) > 3 else 1
+    return 1
+
+
 @dataclass
 class RareItem:
     slot: str
@@ -38,8 +48,9 @@ class RareItem:
     quality: int = 20
 
     def can_add(self, mod: dict) -> bool:
+        maximum = 2 if self.slot == "Jewel" else 3
         return (eligible(mod, self.definition, self.item_level) and
-                sum(entry["kind"] == mod["kind"] for entry in self.mods) < 3 and
+                sum(entry["kind"] == mod["kind"] for entry in self.mods) < maximum and
                 all(entry["group"] != mod["group"] for entry in self.mods))
 
     def text(self, sockets: int) -> str:
@@ -63,6 +74,8 @@ class GameData:
         self.by_id = {gem["id"]: gem for gem in self.gems.values()}
         self.bases = metadata["bases"]
         self.mods = metadata["mods"]
+        self.jewel_mods = metadata.get("jewelMods", [])
+        self.unique_items = metadata.get("uniqueItems")
         self.main_names = sorted(name for name, gem in self.gems.items()
                                  if not gem.get("support") and not gem.get("unsupported")
                                  and (not set(gem.get("tags", {})) & UTILITY_TAGS or
@@ -93,7 +106,8 @@ class GameData:
 
 
 def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
-                   character_level: int | None = None) -> list[RareItem]:
+                   character_level: int | None = None, damage_type: str = "physical",
+                   base_damage_type: str | None = None, focus: str = "balanced") -> list[RareItem]:
     weapon_bases = {"Wand": "Prophecy Wand", "Bow": "Thicket Bow", "Staff": "Judgement Staff",
                     "Claw": "Imperial Claw", "Dagger": "Imperial Skean",
                     "One Handed Sword": "Jewelled Foil", "One Handed Axe": "Siege Axe",
@@ -106,6 +120,9 @@ def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
     if weapon_type not in {"Bow", "Staff"}:
         slots["Weapon 2"] = "Titanium Spirit Shield"
     result = []
+    base_damage_type = base_damage_type or damage_type
+    title_damage = damage_type.title()
+    title_base_damage = base_damage_type.title()
     for slot, base in slots.items():
         if base not in data.bases:
             raise ValueError(f"Installed PoB has no required template base {base}")
@@ -114,28 +131,53 @@ def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
             choices = [(name, entry) for name, entry in data.bases.items()
                        if entry["type"] == wanted["type"] and entry.get("subType") == wanted.get("subType")
                        and entry.get("tags", {}).get("default")
-                       and entry.get("req", {}).get("level", 1) <= character_level]
+                       and base_required_level(entry) <= character_level]
             if not choices:
                 raise ValueError(f"No level-{character_level} base for {slot}")
-            base, _ = max(choices, key=lambda row: (row[1].get("req", {}).get("level", 1), row[0]))
+            base, _ = max(choices, key=lambda row: (base_required_level(row[1]), row[0]))
         item = RareItem(slot, base, data.bases[base], item_level=character_level or 80,
                         quality=0 if character_level is not None else 20)
         scale = min(1, character_level / 80) if character_level is not None else 1
         if slot == "Weapon 1":
             if archetype == "minion":
                 data.add_mod(item, r"Minions deal (\d+(?:\.\d+)?)% increased Damage", 65 * scale)
+                # Convoking Wands can roll two independent global minion
+                # affixes in addition to damage.  Leaving either slot empty
+                # materially weakens every minion build before the complete
+                # design search even begins.
+                data.add_mod(item, r"\+(\d+(?:\.\d+)?) to Level of all Minion Skill Gems", 1)
+                data.add_mod(item, r"Minions have (\d+(?:\.\d+)?)% increased Attack and Cast Speed", 18 * scale)
             elif weapon_type in {"Wand", "Staff", "Sceptre", "Dagger"} and archetype != "attack":
                 data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Spell Damage", 70 * scale)
+                if archetype in {"spell", "ignite", "dot"}:
+                    data.add_mod(item, rf"\+(\d+(?:\.\d+)?) to Level of all {title_base_damage} Spell Skill Gems", 1)
+                    data.add_mod(item, rf"(\d+(?:\.\d+)?)% increased {title_damage} Damage", 35 * scale)
                 data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Cast Speed", 15 * scale)
             else:
                 data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Physical Damage", 120 * scale)
                 data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Attack Speed", 15 * scale)
         else:
             data.add_mod(item, r"\+(\d+(?:\.\d+)?) to maximum Life", 110 * scale)
+            if slot == "Amulet" and archetype in {"spell", "ignite", "dot"}:
+                data.add_mod(item, rf"\+(\d+(?:\.\d+)?) to Level of all {title_base_damage} Skill Gems", 1)
+                if archetype in {"ignite", "dot"}:
+                    data.add_mod(item, r"\+(\d+(?:\.\d+)?)% to Damage over Time Multiplier", 18)
+                    if damage_type in {"fire", "cold", "lightning", "chaos"}:
+                        data.add_mod(item, rf"(\d+(?:\.\d+)?)% increased {title_damage} Damage", 20)
+                else:
+                    data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Spell Damage", 35 * scale)
+            if (slot.startswith("Ring") and focus == "damage" and
+                    archetype in {"spell", "ignite", "dot"} and
+                    damage_type in {"fire", "cold", "lightning", "chaos"}):
+                data.add_mod(item, rf"(\d+(?:\.\d+)?)% increased {title_damage} Damage", 20 * scale)
             if data.bases[base]["type"] in {"Helmet", "Body Armour", "Gloves", "Boots", "Shield"}:
                 data.add_mod(item, r"\+(\d+(?:\.\d+)?) to maximum Energy Shield", 65 * scale)
                 if slot == "Boots":
                     data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Movement Speed", max(10, 25 * scale))
+                elif slot == "Weapon 2" and archetype in {"spell", "ignite", "dot"} and focus == "damage":
+                    data.add_mod(item, rf"(\d+(?:\.\d+)?)% increased {title_damage} Damage", 55 * scale)
+                elif slot == "Weapon 2" and archetype in {"spell", "ignite", "dot"} and focus == "balanced":
+                    data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Spell Damage", 55 * scale)
                 else:
                     data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Energy Shield", 80 * scale)
         result.append(item)
@@ -164,7 +206,8 @@ def solve_suffixes(items: list[RareItem], data: GameData, output: dict, *, resis
             if deficit <= 0:
                 continue
             target = 35 if requirement in {"Fire", "Cold", "Lightning"} else 45
-            choices = [(item, data.pick_mod(item, patterns[requirement], target)) for item in items]
+            choices = [(item, data.pick_mod(item, patterns[requirement], target)) for item in items
+                       if not item.slot.startswith("Flask ")]
             options[requirement] = [(item, mod) for item, mod in choices if mod]
         available = [key for key in options if options[key]]
         if not available:

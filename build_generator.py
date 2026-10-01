@@ -419,6 +419,13 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
                             for path in (context["pobHome"] / "Data" / "Uniques").rglob("*.lua"))
     foulborn_map = context["pobHome"] / "Data" / "ModFoulbornMap.lua"
     foulborn_text = foulborn_map.read_text(encoding="utf-8") if foulborn_map.is_file() else ""
+    def known_unique_name(name: str) -> bool:
+        # Ordinary entries are keyed by the item title. PoB also stores some
+        # generated unique families (such as Precursor's Emblem) inside [[...]]
+        # blocks, so accept an exact block-title line as well.
+        return bool(re.search(rf"(?m)^{re.escape(name)}$", unique_text) or
+                    re.search(rf"(?m)^\s*\"{re.escape(name)}\"\s*,?\s*$", unique_text) or
+                    re.search(rf"\[\[{re.escape(name)}(?:\r?\n|$)", unique_text))
     invalid_items = []
     gear = []
     for name, (_, item) in slots.items():
@@ -432,14 +439,47 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
         if f'itemBases["{base}"]' not in base_text and name in REQUIRED_SLOTS:
             invalid_items.append(f"{name} base {base}")
         if rarity == "unique":
-            known_unique = bool(re.search(rf"(?m)^{re.escape(item_name)}$", unique_text))
+            known_unique = known_unique_name(item_name)
             if item_name.startswith("Foulborn "):
                 base_unique = item_name.removeprefix("Foulborn ")
                 known_unique = (bool(re.search(rf"(?m)^{re.escape(base_unique)}$", unique_text))
                                 and f'["{base_unique}"]' in foulborn_text)
             if not known_unique:
                 invalid_items.append(f"{name} unique {item_name}")
-        gear.append({"slot": name, "rarity": rarity, "name": item_name, "base": base})
+        variants = re.findall(r"(?m)^Variant:\s*(.+)$", item.text or "")
+        selected_variant = re.search(r"(?m)^Selected Variant:\s*(\d+)$", item.text or "")
+        variant = None
+        if selected_variant and variants:
+            index = int(selected_variant.group(1)) - 1
+            if 0 <= index < len(variants) and variants[index] != "Current":
+                variant = variants[index]
+        sockets = _socket_colors(item.text or "")
+        gear.append({"slot": name, "rarity": rarity, "name": item_name, "base": base,
+                     "variant": variant, "links": len(sockets) if sockets else None})
+    jewel_failures = []
+    for socket in spec.findall("./Sockets/Socket"):
+        node_id, item_id = socket.get("nodeId"), socket.get("itemId")
+        item = item_ids.get(item_id)
+        if (node_id not in nodes or not official.get(node_id, {}).get("isJewelSocket") or
+                item is None or item_id in {entry.get("itemId") for entry in spec.findall("./Sockets/Socket")
+                                            if entry is not socket}):
+            jewel_failures.append(node_id or "unknown socket")
+            continue
+        try:
+            rarity, item_name, base = _item_parts(item.text)
+        except ValueError:
+            jewel_failures.append(node_id)
+            continue
+        if base not in base_text or "Jewel" not in base:
+            jewel_failures.append(node_id)
+            continue
+        if rarity == "unique" and not known_unique_name(item_name):
+            jewel_failures.append(node_id)
+            continue
+        gear.append({"slot": "Jewel " + node_id, "rarity": rarity, "name": item_name,
+                     "base": base, "variant": None, "links": None})
+    check("Jewel socket assignments", not jewel_failures,
+          f"Socketed jewels require distinct allocated ordinary sockets and installed jewel bases; invalid: {jewel_failures}")
     check("Current item definitions", not invalid_items, f"Unknown PoB item definitions: {invalid_items[:6]}")
     check("Configuration", root.find("./Config/ConfigSet") is not None, "PoB configuration set is required")
     return checks, {"level": level, "gear": gear, "gems": [g.get("nameSpec") for g in gems],
@@ -487,10 +527,27 @@ def quote(gear: list[dict], market: dict, cap: float) -> dict:
     unknown = []
     priced = []
     for item in gear:
-        if item["rarity"] == "unique" and market["prices"].get(item["name"]):
-            value = max(market["prices"][item["name"]])
+        unique_listings = market.get("listings", {}).get(item["name"], []) if item["rarity"] == "unique" else []
+        if unique_listings:
+            variant = item.get("variant")
+            links = item.get("links")
+            compatible = [listing for listing in unique_listings
+                          if ((listing.get("variant") in {None, "Current"} if variant is None
+                               else listing.get("variant") == variant))
+                          and (links is None or listing.get("links") in {None, links})]
+            if not compatible:
+                unknown.append({"slot": item["slot"], "name": item["name"],
+                                "reason": "No quote matches the equipped unique variant and links"})
+                continue
+            value = min(float(listing["chaos"]) for listing in compatible)
             subtotal += value
-            priced.append({"slot": item["slot"], "name": item["name"], "chaos": round(value, 1), "kind": "estimated"})
+            priced.append({"slot": item["slot"], "name": item["name"], "variant": variant,
+                           "links": links, "chaos": round(value, 1), "kind": "estimated"})
+        elif item["rarity"] == "unique" and market["prices"].get(item["name"]) and not market.get("listings"):
+            # Old snapshots lack per-variant/link detail. Do not combine them
+            # under one item name or treat their maximum as a compatible quote.
+            unknown.append({"slot": item["slot"], "name": item["name"],
+                            "reason": "Snapshot has no variant/link-specific unique quote"})
         else:
             display = item["base"] if item["rarity"] == "rare" else item["name"]
             unknown.append({"slot": item["slot"], "name": display, "reason": "Rare/magic item needs a modifier-aware trade search" if item["rarity"] != "unique" else "Unique has no current-league quote"})

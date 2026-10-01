@@ -63,11 +63,14 @@ function render(build) {
   root.replaceChildren();
   root.hidden = false;
   const heading = el("div", "result-heading"), title = el("div");
+  const qualityStatus = build.qualityStatus || "unassessed";
+  const qualityLabels = {validated: "Recipe validated", experimental: "Experimental recipe", unassessed: "Quality unassessed"};
   const resultTitle = el("h2", "", `${build.mainSkill} ${build.ascendancy}`);
   resultTitle.id = "result-title";
   title.append(el("p", "eyebrow", "GENERATED BUILD"), resultTitle,
     el("p", "muted", `Level ${build.level} Witch · ${build.league} · tree ${build.treeVersion.replace("_", ".")} · PoB ${build.pobVersion}`));
-  heading.append(title, el("span", "validation-pill", "PoB validated"));
+  heading.append(title, el("span", `validation-pill quality-${qualityStatus}`,
+    qualityLabels[qualityStatus] || "Quality unassessed"));
   root.append(heading);
 
   const share = el("div", build.shareStatus === "published" ? "share-card published" : "share-card pending");
@@ -81,7 +84,7 @@ function render(build) {
     copy.onclick = async () => { await navigator.clipboard.writeText(build.shareUrl); copy.textContent = "Copied"; };
     share.append(copy);
   } else {
-    share.append(el("p", "", build.shareError || "The validated build was saved locally. Retry publication when pobb.in is available."));
+    share.append(el("p", "", build.shareError || "The build passed PoB checks and was saved locally. Retry publication when pobb.in is available."));
     const retry = el("button", "small-button", "Retry sharing");
     retry.type = "button";
     retry.onclick = async () => {
@@ -140,6 +143,30 @@ function render(build) {
       : `Tree adjustment: ${build.recipe.treeChange}. Support: ${build.recipe.changedMainLinks.join(", ")}. ${build.recipe.changedSlots.length ? `Changed gear: ${build.recipe.changedSlots.join(", ")}.` : "Source gear kept after validation."}`),
     el("p", "muted", build.recipe.modelReason || "PoB calculates the resulting export."));
   if (build.recipe.levelChange) plan.append(el("p", "muted", build.recipe.levelChange));
+  if (build.recipe.mechanics) {
+    const mechanics = build.recipe.mechanics;
+    plan.append(el("p", "muted", `Mechanics profile: ${mechanics.name || mechanics.profile || "generic"} · ${mechanics.damageSource || "unknown source"} · ${mechanics.hitOrAilment || "unclassified"}`));
+  }
+  if (build.mechanicChecks?.length) {
+    const mechanicDetails = el("details", "checks"), mechanicList = el("ul");
+    mechanicDetails.append(el("summary", "", `Mechanic checks · ${build.mechanicChecks.filter(check => check.passed).length}/${build.mechanicChecks.length} passed`));
+    for (const check of build.mechanicChecks) mechanicList.append(el("li", "", `${check.passed ? "✓" : "✗"} ${check.name}: ${check.reason}`));
+    mechanicDetails.append(mechanicList); plan.append(mechanicDetails);
+  }
+  if (build.qualityWarnings?.length) {
+    const warnings = el("ul", "quality-warnings");
+    for (const warning of build.qualityWarnings) warnings.append(el("li", "", warning));
+    plan.append(el("h4", "", "Quality notes"), warnings);
+  }
+  const reasons = Object.entries(build.recipe.selectionReasons || {});
+  if (reasons.length) {
+    const reasonList = el("ul", "selection-reasons");
+    for (const [kind, reason] of reasons) {
+      const values = Array.isArray(reason) ? reason : [reason];
+      for (const value of values) if (value) reasonList.append(el("li", "", `${kind}: ${value}`));
+    }
+    plan.append(el("h4", "", "Selection reasons"), reasonList);
+  }
   const checks = el("details", "checks"), list = el("ul");
   checks.append(el("summary", "", `Validation checks · ${build.validation.filter(v => v.passed).length}/${build.validation.length} passed`));
   for (const check of build.validation) list.append(el("li", "", `${check.passed ? "✓" : "✗"} ${check.name}: ${check.reason}`));
@@ -155,7 +182,7 @@ async function poll(jobId) {
     if (job.status === "failed") throw new Error(job.error || "Generation failed");
     if (["complete", "share_failed"].includes(job.status)) {
       render(job.result);
-      if (job.status === "share_failed") showError("The build is validated and saved, but pobb.in publication failed. Use Retry sharing in the result.");
+      if (job.status === "share_failed") showError("The build passed PoB checks and was saved, but pobb.in publication failed. Use Retry sharing in the result.");
       return;
     }
   }

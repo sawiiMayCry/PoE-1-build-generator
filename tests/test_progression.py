@@ -1,11 +1,27 @@
 import unittest
 import xml.etree.ElementTree as ET
 
-from build_progression import ascendancy_order, combine_loadouts, connected_order, gem_level, milestones, select_stage, stage_checks, stage_skill
+from build_progression import (add_flasks, ascendancy_order, combine_loadouts, connected_order,
+                               gem_level, milestones, select_stage, stage_checks, stage_skill)
 from generation_data import GameData, RareItem
 
 
 class BuildProgression(unittest.TestCase):
+    def test_add_flasks_preserves_an_existing_unique_flask_slot(self):
+        root = ET.fromstring("""<PathOfBuilding><Items activeItemSet="1"><Item id="1">Rarity: UNIQUE
+Rumi's Concoction
+Granite Flask</Item><ItemSet id="1"><Slot name="Flask 2" itemId="1" active="false" /></ItemSet></Items></PathOfBuilding>""")
+        data = GameData({"gems": [], "mods": [], "bases": {
+            name: {"type": "Flask", "req": {"level": 1}}
+            for name in ("Greater Life Flask", "Greater Mana Flask", "Quicksilver Flask",
+                         "Granite Flask", "Quartz Flask")}})
+        add_flasks(root, data, 80)
+        item_set = root.find("./Items/ItemSet")
+        slots = {slot.get("name"): slot.get("itemId") for slot in item_set.findall("Slot")}
+        self.assertEqual(set(slots), {f"Flask {index}" for index in range(1, 6)})
+        self.assertEqual(slots["Flask 2"], "1")
+        self.assertIn("Rumi's Concoction", root.find("./Items/Item[@id='1']").text)
+
     def test_act_budgets_penalties_and_lab_unlocks(self):
         phases = milestones(89)
         self.assertEqual(len(phases), 13)
@@ -105,6 +121,27 @@ Sockets: B</Item><ItemSet id="1"><Slot name="Body Armour" itemId="1"/></ItemSet>
                 "passives": {"used": 0, "ascendancy": 0}}
         checks = stage_checks(xml, milestones(90)[-1], calc, data, {"tree": {"nodes": {"1": {"classStartIndex": 3}}}})
         self.assertTrue(next(check["passed"] for check in checks if check["name"] == "Stage gem levels"))
+        self.assertTrue(next(check["passed"] for check in checks if check["name"] == "Stage sockets"))
+
+    def test_stage_socket_check_uses_the_selected_merged_item_set(self):
+        data = GameData({"gems": [{"id": "Fireball", "gameId": "Fireball", "skillId": "Fireball",
+                                   "name": "Fireball", "levels": [{"level": 1, "requiredLevel": 1}]}],
+                         "bases": {"Simple Robe": {"req": {"level": 1}}}, "mods": []})
+        xml = '''<PathOfBuilding><Build level="90"/><Tree activeSpec="2"><Spec nodes="1"/>
+          <Spec nodes="1"/></Tree><Skills activeSkillSet="2"><SkillSet id="1"><Skill slot="Body Armour">
+          <Gem gemId="Fireball" nameSpec="Fireball" level="1"/><Gem gemId="Fireball" nameSpec="Fireball" level="1"/></Skill></SkillSet>
+          <SkillSet id="2"><Skill slot="Body Armour"><Gem gemId="Fireball" nameSpec="Fireball" level="1"/></Skill></SkillSet></Skills>
+          <Items activeItemSet="2"><Item id="1">Rarity: NORMAL
+Simple Robe</Item><Item id="2">Rarity: NORMAL
+Simple Robe
+Sockets: B</Item><ItemSet id="1"><Slot name="Body Armour" itemId="1"/></ItemSet>
+          <ItemSet id="2"><Slot name="Body Armour" itemId="2"/></ItemSet></Items>
+          <Config activeConfigSet="2"><ConfigSet id="1"/><ConfigSet id="2"/></Config></PathOfBuilding>'''
+        calc = {"calculated": True, "stats": {"Life": 4000, "FullDPS": 10, "Str": 100, "Dex": 100,
+                  "Int": 100, "FireResist": 75, "ColdResist": 75, "LightningResist": 75,
+                  "ManaUnreserved": 100}, "passives": {"used": 0, "ascendancy": 0}}
+        checks = stage_checks(xml, milestones(90)[-1], calc, data,
+                              {"tree": {"nodes": {"1": {"classStartIndex": 3}}}})
         self.assertTrue(next(check["passed"] for check in checks if check["name"] == "Stage sockets"))
 
     def test_minion_equipment_references_follow_their_stage_item_set(self):

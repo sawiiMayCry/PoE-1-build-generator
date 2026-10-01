@@ -169,6 +169,7 @@ class PobWorker:
         self.state = None
         self.lua = None
         self.calls = 0
+        self.export_recoveries = 0
 
     def _execute(self, script: str):
         status = self.lua.luaL_loadstring(self.state, script.encode("utf-8"))
@@ -287,8 +288,31 @@ def export_with_pob(xml: str, app_root: Path, data_root: Path) -> dict:
     PoB's saved PlayerStat/MinionStat data and normal export metadata.
     """
     worker = get_worker(app_root, data_root)
-    exported = worker.request("export", xml=xml)
+    try:
+        exported = worker.request("export", xml=xml)
+    except RuntimeError as exc:
+        # PoB can leave an imported, calculated build usable while tearing
+        # down its saver registry during repeated headless imports. In that
+        # state calculation succeeds but SaveDB reports `pairs(nil)` from
+        # Build:SaveDB. A failed worker request closes the Lua state, so retry
+        # once on the freshly initialized persistent worker before rejecting
+        # an otherwise valid candidate.
+        message = str(exc)
+        if "Build.lua:2044" not in message or "pairs" not in message:
+            raise
+        worker.export_recoveries = getattr(worker, "export_recoveries", 0) + 1
+        exported = worker.request("export", xml=xml)
     reimported = worker.request("calculate", xml=exported["xml"])
     if reimported != {key: value for key, value in exported.items() if key != "xml"}:
-        raise RuntimeError("PoB export changed the calculated build; sharing stopped")
+        # On the first save, PoB materializes default combat placeholders in
+        # ConfigSet. Those defaults can affect defensive outputs (for example
+        # TotalEHP) when the serialized build is imported. Save that normalized
+        # build once more so the returned export and its reimport describe the
+        # same calculation. The second roundtrip remains strict.
+        exported = worker.request("export", xml=exported["xml"])
+        reimported = worker.request("calculate", xml=exported["xml"])
+    if reimported != {key: value for key, value in exported.items() if key != "xml"}:
+        differing = [key for key in set(reimported) | (set(exported) - {"xml"})
+                     if key != "xml" and reimported.get(key) != exported.get(key)]
+        raise RuntimeError("PoB export changed the calculated build fields: " + ", ".join(sorted(differing)))
     return {**reimported, "xml": exported["xml"]}
