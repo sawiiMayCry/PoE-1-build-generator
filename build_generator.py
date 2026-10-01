@@ -403,8 +403,8 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
     gems = main.findall("Gem")
     gem_data = (context["pobHome"] / "Data" / "Gems.lua").read_text(encoding="utf-8")
     bad_gems = [g.get("nameSpec") for g in gems if not g.get("gemId") or f'"{g.get("gemId")}"' not in gem_data]
-    check("Main skill and gem IDs", len(gems) >= 5 and any(g.get("nameSpec") == skill for g in gems) and not bad_gems,
-          f"Main link needs {skill} and at least five known gems; unknown: {bad_gems}")
+    check("Main skill and gem IDs", len(gems) >= 2 and any(g.get("nameSpec") == skill for g in gems) and not bad_gems,
+          f"Main link needs {skill} and at least one known, useful support; unknown: {bad_gems}")
     items, slots = _items_by_slot(root)
     missing_slots = [name for name in REQUIRED_SLOTS if name not in slots or slots[name][1] is None]
     check("Complete equipment", not missing_slots, f"Missing equipped slots: {missing_slots}")

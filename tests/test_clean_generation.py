@@ -1,5 +1,6 @@
 import unittest
 import json
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import tempfile
@@ -8,14 +9,16 @@ from unittest.mock import patch, MagicMock
 from build_assembly import assemble
 from generation_data import GameData, RareItem, eligible, rare_templates, roll_line, solve_suffixes
 from passive_search import (SearchBudget, graph, paths_from, initial_nodes, mastery_choices, score,
-                            recounted_stats, search_tree, tree_pool_target, resource_deficit, heuristic)
+                            recounted_stats, search_tree, tree_pool_target, resource_deficit, heuristic,
+                            temporary_minion_population)
 from real_generator import (assess_mechanics, assess_quality, budget_from_prompt, current_unique, mechanic_profile,
                             calculate_finalist, named_skill, normalize_intent, ordinary_jewel_templates,
-                            sync_permanent_minion_count, choose_support_candidate, search_links,
+                            sync_permanent_minion_count, choose_support_candidate, search_curse, search_links,
                             missing_unique_reason, unique_jewel_shortlist, unique_options, mentioned_uniques,
                             release_repairable_suffixes, unique_pair_shortlist, tree_reroute_removals,
                             support_candidate_shortlist, support_refinement_order, reconcile_unique_package_trace,
-                            validate_design, target_dps, complete_design_search,
+                            support_gain_is_meaningful, support_mechanism_compatible, validate_design,
+                            mapping_support_plan, clear_coverage_role, target_dps, complete_design_search,
                             sustained_resource_use, mana_utility_levels, search_mana_utility,
                             unique_pair_has_weapon_conflict, unique_package_within_budget)
 
@@ -29,10 +32,12 @@ def gem(name, tags, support=False):
 def definitions():
     return GameData({"gems": [gem("Ethereal Knives", ["spell", "physical"]), gem("Frenzy", ["attack"]),
         gem("Winter Orb", ["spell", "cold"]), gem("Raise Zombie", ["spell", "minion"]),
+        gem("Summon Raging Spirit", ["spell", "minion", "fire"]),
         gem("Hatred", ["aura", "cold"]), gem("Flame Dash", ["movement"]), gem("Steelskin", ["guard"]),
         gem("Determination", ["aura"]), gem("Vulnerability", ["curse"]), gem("Frostbite", ["curse"]),
         gem("Malevolence", ["aura"]), gem("Flammability", ["curse"]),
         gem("Bane", ["hex", "chaos", "spell"]), gem("Bane of Condemnation", ["hex", "chaos", "spell"]),
+        gem("Despair", ["curse", "chaos"]),
         gem("Added Cold Damage", ["support"], True)], "bases": {}, "mods": []})
 
 
@@ -67,12 +72,82 @@ class CleanGeneration(unittest.TestCase):
         self.assertEqual(len(trace), 5)
         self.assertEqual(trace[0]["sustainableCandidates"], 5)
 
+    def test_support_selection_stops_before_a_compatible_but_useless_support(self):
+        supports = [gem(f"Support {index}", ["support"], True) for index in range(5)]
+        data = GameData({"gems": [gem("Winter Orb", ["spell", "cold"]), *supports],
+                         "bases": {}, "mods": []})
+        identifiers = [entry["id"] for entry in supports]
+
+        class Worker:
+            def request(self, operation, **kwargs):
+                count = int(re.search(r"count='(\d+)'", kwargs.get("xml", "<x count='0'/>"))[1])
+                baseline = 100 + count * 100
+                if operation == "supports":
+                    return {"supports": identifiers}
+                if operation == "calculate":
+                    return {"stats": {"FullDPS": baseline, "ManaUnreserved": 100,
+                                       "ManaCost": 1, "ManaRegen": 10, "LifeUnreserved": 100,
+                                       "Life": 100, "Speed": 1}}
+                if operation == "supportScores":
+                    gain = 0 if count >= 3 else 100
+                    return {"candidates": [{"id": identifier,
+                                             "stats": {"FullDPS": baseline + gain,
+                                                       "ManaUnreserved": 100, "ManaCost": 1,
+                                                       "ManaRegen": 10, "LifeUnreserved": 100,
+                                                       "Life": 100, "Speed": 1}}
+                                            for identifier in kwargs["candidates"]]}
+                raise AssertionError(operation)
+
+        trace = []
+        selected = search_links({"skill": "Winter Orb", "archetype": "spell", "focus": "damage",
+                                 "damageType": "cold", "baseDamageType": "cold"},
+                                data, lambda links: f"<Link count='{len(links)}' />", Worker(),
+                                lambda _: None, trace=trace)
+        self.assertEqual(len(selected), 3)
+        self.assertIn("at least 0.5%", trace[-1]["reason"])
+
+    def test_exact_exported_srs_regression_fixture_captures_unsupported_link(self):
+        fixture = Path(__file__).parent / "fixtures" / "srs_generated_20261001.xml"
+        root = ET.parse(fixture).getroot()
+        active = root.find("Skills").get("activeSkillSet")
+        skill_set = next(entry for entry in root.findall("./Skills/SkillSet") if entry.get("id") == active)
+        main = next(entry for entry in skill_set.findall("Skill")
+                    if entry.get("includeInFullDPS") == "true")
+        names = [gem.get("nameSpec") for gem in main.findall("Gem")]
+        self.assertEqual(names, ["Summon Raging Spirit", "Added Chaos Damage", "Chance to Poison",
+                                 "Block Chance Reduction", "Inspiration"])
+        utilities = [gem.get("nameSpec") for entry in skill_set.findall("Skill") if entry is not main
+                     for gem in entry.findall("Gem")]
+        self.assertIn("Flammability", utilities)
+        self.assertFalse(support_gain_is_meaningful(264735.38, 265681.29))
+        self.assertFalse(support_mechanism_compatible(
+            gem("Chance to Poison", ["support"], True),
+            {"damageMechanism": "minion_hit"}))
+        population = temporary_minion_population(
+            {"ManaCost": 20, "ManaRegen": 32.1, "Speed": 2.92, "Duration": 8.217,
+             "ActiveMinionLimit": 20},
+            {"skill": "Summon Raging Spirit", "resourceReserveFraction": 0.15})
+        self.assertEqual(population, (11, True))
+
+    def test_mapping_coverage_is_reported_separately_from_boss_support_damage(self):
+        plan = mapping_support_plan([{"kind": "support_selection", "link_index": 2,
+            "selected": "Minion Damage", "candidates": [
+                {"name": "Minion Damage", "damage": 100000, "sustainedDamage": 100000, "feasible": True},
+                {"name": "Melee Splash", "damage": 80000, "sustainedDamage": 80000, "feasible": True},
+                {"name": "Block Chance Reduction", "damage": 0, "sustainedDamage": 0, "feasible": True}]}],
+            ["Minion Damage"])
+        self.assertEqual(clear_coverage_role("Melee Splash"), "area coverage")
+        self.assertEqual(plan["bossLink"], ["Minion Damage"])
+        self.assertEqual(plan["mappingAlternatives"][0]["support"], "Melee Splash")
+        self.assertEqual(plan["mappingAlternatives"][0]["singleTargetRetention"], 0.8)
+        self.assertIn("not converted into single-target DPS", plan["coverageModel"])
+
     def test_damage_focus_support_choice_accounts_for_long_run_cast_uptime(self):
         entries = [
             {"id": "damage", "stats": {"FullDPS": 100_000, "ManaCost": 10,
-                                            "ManaRegen": 50, "Speed": 10}},
+                                            "ManaRegen": 60, "Speed": 10}},
             {"id": "sustain", "stats": {"FullDPS": 60_000, "ManaCost": 5,
-                                            "ManaRegen": 50, "Speed": 10}},
+                                            "ManaRegen": 60, "Speed": 10}},
         ]
         selected, sustain, accepted = choose_support_candidate(
             entries, {"skill": "Winter Orb", "archetype": "spell", "focus": "damage"})
@@ -137,7 +212,7 @@ class CleanGeneration(unittest.TestCase):
              "ActiveMinionLimit": 20},
             {"skill": "Summon Raging Spirit", "archetype": "minion", "minionCount": 20})
         self.assertTrue(srs["sustainable"])
-        self.assertEqual(srs["population"], 8)
+        self.assertEqual(srs["population"], 7)
 
     def test_clarity_search_chooses_lowest_level_that_sustains_mana(self):
         clarity = gem("Clarity", ["aura", "spell"])
@@ -172,7 +247,7 @@ class CleanGeneration(unittest.TestCase):
         self.assertEqual(spec["gemLevels"]["Clarity"], 4)
         self.assertEqual(result["stats"]["ManaRegen"], 55)
         selected = next(entry for entry in trace if entry["kind"] == "resource_utility_search")
-        self.assertTrue(selected["sustainable"])
+        self.assertFalse(selected["sustainable"])
         self.assertEqual(selected["selectedLevel"], 4)
         self.assertEqual(budget.used, 5)
 
@@ -315,6 +390,52 @@ class CleanGeneration(unittest.TestCase):
                                   {"divineChaos": 200})
         self.assertIn("Vulnerability", minion["utility"])
         self.assertNotIn("Frostbite", minion["utility"])
+
+    def test_srs_hit_and_poison_requests_get_distinct_mechanism_packages(self):
+        hit = normalize_intent("Level 90 Summon Raging Spirit Necromancer", {}, definitions(),
+                               {"divineChaos": 200})
+        poison = normalize_intent("Level 90 Summon Raging Spirit Necromancer poison", {}, definitions(),
+                                  {"divineChaos": 200})
+        self.assertEqual(hit["damageMechanism"], "minion_hit")
+        self.assertEqual(hit["damageType"], "fire")
+        self.assertIn("Flammability", hit["utility"])
+        self.assertEqual(poison["damageMechanism"], "poison")
+        self.assertEqual(poison["baseDamageType"], "fire")
+        self.assertEqual(poison["damageType"], "chaos")
+        self.assertIn("Despair", poison["utility"])
+        poison_support = gem("Chance to Poison", ["support"], True)
+        self.assertFalse(support_mechanism_compatible(poison_support, hit))
+        self.assertTrue(support_mechanism_compatible(poison_support, poison))
+
+    def test_curse_search_uses_measured_damage_and_keeps_one_curse_slot(self):
+        data = GameData({"gems": [gem(name, tags) for name, tags in (
+            ("Flammability", ["curse"]), ("Despair", ["curse", "chaos"]),
+            ("Vulnerability", ["curse"]))], "bases": {}, "mods": []})
+        spec = {"skill": "Winter Orb", "archetype": "spell", "focus": "balanced",
+                "damageType": "fire", "damageMechanism": "spell_hit", "expectedCurse": "Flammability",
+                "utility": {"Flammability": "Gloves"}}
+        scores = {"Flammability": 100.0, "Despair": 120.0, "Vulnerability": 90.0}
+
+        class Worker:
+            def request(self, operation, **kwargs):
+                root = ET.fromstring(kwargs["xml"])
+                name = next(gem.get("nameSpec") for gem in root.findall("./Skills/SkillSet/Skill/Gem"))
+                return {"calculated": True, "stats": {"FullDPS": scores[name], "ManaCost": 1,
+                         "ManaRegen": 10, "Speed": 1, "ManaUnreserved": 100}}
+
+        def render():
+            return f'''<PathOfBuilding><Skills><SkillSet id="1"><Skill><Gem nameSpec="{next(iter(spec['utility']))}"/></Skill>
+              </SkillSet></Skills></PathOfBuilding>'''
+
+        trace = []
+        selected = search_curse(spec, data, render, Worker(),
+                                {"calculated": True, "stats": {"FullDPS": 100.0,
+                                 "ManaCost": 1, "ManaRegen": 10, "Speed": 1, "ManaUnreserved": 100}},
+                                trace=trace)
+        self.assertEqual(spec["expectedCurse"], "Despair")
+        self.assertEqual(spec["utility"], {"Despair": "Gloves"})
+        self.assertEqual(selected["stats"]["FullDPS"], 120.0)
+        self.assertEqual(trace[0]["selected"], "Despair")
 
     def test_graph_is_bidirectional_and_excludes_synthetic_root(self):
         nodes = {"root": {"out": ["1"]}, "1": {"out": ["2"]}, "2": {"in": ["1"], "out": ["3"]}, "3": {}}
@@ -656,14 +777,14 @@ class CleanGeneration(unittest.TestCase):
         spec = {"skill": "Summon Raging Spirit", "minionCount": 2}
         stats = recounted_stats({"FullDPS": 1000, "Speed": 2.5, "ManaCost": 50,
                                  "ManaRegen": 25, "Duration": 8.2, "ActiveMinionLimit": 20}, spec)
-        self.assertEqual(stats["FullDPS"], 2000)
+        self.assertEqual(stats["FullDPS"], 1500)
         unsustainable = recounted_stats({"FullDPS": 1000, "Speed": 2.5, "ManaCost": 50,
                                           "ManaRegen": 0, "Duration": 8.2, "ActiveMinionLimit": 20}, spec)
         self.assertEqual(unsustainable["FullDPS"], 500)
         life_limited = recounted_stats({"FullDPS": 1000, "Speed": 2.5, "ManaCost": 0,
                                         "LifeCost": 100, "LifeRegenRecovery": 50,
                                         "Duration": 8.2, "ActiveMinionLimit": 20}, spec)
-        self.assertEqual(life_limited["FullDPS"], 2000,
+        self.assertEqual(life_limited["FullDPS"], 1500,
                          "Lifetap uses life regeneration when estimating temporary spirits")
         unsustainable_life = {"skill": "Summon Raging Spirit", "minionCount": 2}
         self.assertTrue(sync_permanent_minion_count(
@@ -785,7 +906,7 @@ class CleanGeneration(unittest.TestCase):
         calculation = {"stats": {"Speed": 3.0, "ManaCost": 10.0, "ManaRegen": 12.0,
                                   "Duration": 5.0, "ActiveMinionLimit": 20}}
         self.assertTrue(sync_permanent_minion_count(spec, calculation))
-        self.assertEqual(spec["minionCount"], 6)
+        self.assertEqual(spec["minionCount"], 5)
         calculation["stats"]["ManaRegen"] = 3.9
         self.assertTrue(sync_permanent_minion_count(spec, calculation))
         self.assertEqual(spec["minionCount"], 1)

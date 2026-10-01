@@ -7,6 +7,8 @@ from collections import deque
 
 from build_generator import offense_value
 
+DEFAULT_UTILITY_RESOURCE_RESERVE = 0.15
+
 
 def tree_pool_target(spec: dict) -> int:
     """Life+ES target aligned with endgame quality gates and focus."""
@@ -34,6 +36,9 @@ def temporary_minion_population(output: dict, spec: dict) -> tuple[int, bool] | 
             cost = max(0.0, float(output.get(cost_key, 0) or 0))
             if cost > 0:
                 regen = max(0.0, float(output.get(regen_key, 0) or 0))
+                reserve = min(0.5, max(0.0, float(spec.get(
+                    "resourceReserveFraction", DEFAULT_UTILITY_RESOURCE_RESERVE))))
+                regen *= 1 - reserve
                 rates.append(regen / cost)
         rate = max(0.0, min(rates))
         sustainable_count = rate * duration
@@ -65,9 +70,15 @@ def sustained_resource_use(output: dict, spec: dict) -> dict | None:
         use_rate = max(0.0, float(output.get(cost_key, 0) or 0)) * speed
         available = max(0.0, float(output.get(regen_key, 0) or 0))
         if use_rate > 0:
+            reserve = min(0.5, max(0.0, float(spec.get(
+                "resourceReserveFraction", DEFAULT_UTILITY_RESOURCE_RESERVE))))
+            net_available = available * (1 - reserve)
             checks.append({"resource": label, "usePerSecond": use_rate,
-                           "availablePerSecond": available,
-                           "sustainable": available + 1e-6 >= use_rate})
+                           "grossAvailablePerSecond": available,
+                           "reservedPerSecond": available * reserve,
+                           "utilityReserveFraction": reserve,
+                           "availablePerSecond": net_available,
+                           "sustainable": net_available + 1e-6 >= use_rate})
     if not checks:
         return {"sustainable": True, "checks": [], "model": "no sustained resource cost"}
     return {"sustainable": all(check["sustainable"] for check in checks),
@@ -110,6 +121,9 @@ def resource_deficit(output: dict, spec: dict) -> tuple[float, float] | None:
                                 ("LifeCost", "LifeRegenRecovery")):
         use = max(0.0, float(output.get(cost_key, 0) or 0)) * speed
         available = max(0.0, float(output.get(regen_key, 0) or 0))
+        reserve = min(0.5, max(0.0, float(spec.get(
+            "resourceReserveFraction", DEFAULT_UTILITY_RESOURCE_RESERVE))))
+        available *= 1 - reserve
         if use > available and use > 0:
             deficits.append((use, available))
     return max(deficits, key=lambda pair: pair[0] - pair[1]) if deficits else None

@@ -315,7 +315,9 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
              "Flasks are recovery/utility bases to obtain and upgrade. They are disabled in calculations, so no permanent flask uptime is assumed.",
              "Upgrade flask suffixes for bleed/corrupted blood, freeze and curse protection as available. Avoid duplicate suffixes.",
              "After Act 5 Kitava replace lost resistances (-30%); after Act 10 Kitava replace them again (-60% total).",
-             "The act checkpoints show targets after those penalties, not pre-Kitava values.", ""]
+             "The act checkpoints show targets after those penalties, not pre-Kitava values.",
+             "RESOURCE PLAN: Main-skill sustain uses at most 85% of calculated recovery, leaving a reserve for movement, curses and other utility casts.",
+             "CURSE: The selected curse matches the build's damage mechanism. Cast it when needed; PoB damage does not assume continuous curse uptime.", ""]
     previous = None
     for phase in stages:
         lines += [phase["title"].upper(), f"Main link: {' -> '.join(phase['gems'])}",
@@ -329,9 +331,15 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
         lines.append("Gems: " + "; ".join(f"{name} level {level}" for name, level in phase["gemLevels"].items()))
         lines.append("Equipment: " + "; ".join(f"{item['slot']}: {item['base']}" for item in phase["gear"]))
         lines.append("")
-    lines += ["MAPPING AND ENDGAME", "Mapping uses a five-link and campaign-accessible rares; acquire the six-link and final equipment before selecting Endgame.",
+    lines += ["MAPPING AND ENDGAME", "Mapping uses meaningful measured supports up to a five-link and campaign-accessible rares; acquire the six-link and final equipment before selecting Endgame.",
               "Endgame is the requested level and generated equipment target. The validation checks establish minimum viability, not boss-kill capability.",
               "Rare items and gems remain unpriced. Improve sustained mana recovery, chaos resistance and ailment protection before harder maps."]
+    mapping = spec.get("mappingSupportPlan", {})
+    if mapping.get("integratedCoverageSupports"):
+        lines.append("The selected link includes clear coverage support: " +
+                     ", ".join(mapping["integratedCoverageSupports"]) + ".")
+    for option in mapping.get("mappingAlternatives", [])[:2]:
+        lines.append(f"CLEAR OPTION: {option['support']} provides {option['role']} at support-socket sweep {option['screeningSocket']}; it retained about {option['singleTargetRetention']:.0%} of the compared single-target support ({option['comparedWith']}). This is a coverage alternative, not a simulated pack-DPS claim; recalculate after swapping it into the finished link.")
     return "\n".join(lines)
 
 

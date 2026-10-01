@@ -85,6 +85,13 @@ def normalize_intent(prompt: str, reply: dict, data: GameData, market: dict) -> 
     archetype = ("minion" if tags.get("minion") else "attack" if tags.get("attack") else
                  "ignite" if ignite else "dot" if tags.get("dot") or gem["name"] in {
                      "Vortex", "Cold Snap", "Bane", "Bane of Condemnation", "Essence Drain", "Contagion", "Soulrend"} else "spell")
+    explicit_poison = bool(re.search(r"\b(poison|poisoning)\b", prompt, re.I))
+    base_damage = damage
+    damage_mechanism = ("ignite" if archetype == "ignite" else "damage_over_time" if archetype == "dot" else
+                        "poison" if explicit_poison else "minion_hit" if archetype == "minion" else
+                        "attack_hit" if archetype == "attack" else "spell_hit")
+    if explicit_poison:
+        damage = "chaos"
     if ignite and asc != "Elementalist" and not tags.get("fire"):
         raise ValueError("This ignite recipe requires a fire skill or Elementalist's Shaper of Flames")
     weapon_types = gem.get("weaponTypes") or {}
@@ -120,10 +127,23 @@ def normalize_intent(prompt: str, reply: dict, data: GameData, market: dict) -> 
         for name in list(utility):
             if data.gem(name)["tags"].get("aura"):
                 del utility[name]
+    default_curse = next((name for name in utility if data.gems.get(name, {}).get("tags", {}).get("curse")), None)
+    requested_curses = [name for name in requested_utilities
+                        if data.gems.get(name, {}).get("tags", {}).get("curse")]
+    if requested_curses and default_curse not in requested_curses:
+        curse_slot = utility.pop(default_curse, "Gloves") if default_curse else "Gloves"
+    else:
+        curse_slot = utility.get(default_curse, "Gloves") if default_curse else "Gloves"
     for name in requested_utilities:
-        utility[name] = "Helmet" if data.gem(name)["tags"].get("aura") else "Boots"
+        utility[name] = ("Helmet" if data.gem(name)["tags"].get("aura") else
+                         curse_slot if name in requested_curses else "Boots")
+    expected_curse = next((name for name in utility if data.gems.get(name, {}).get("tags", {}).get("curse")), None)
     spec = {"skill": gem["name"], "ascendancy": asc, "level": level, "focus": focus,
-            "damageType": "fire" if ignite else damage, "baseDamageType": damage, "archetype": archetype,
+            "damageType": "fire" if ignite else damage, "baseDamageType": base_damage,
+            "damageMechanism": damage_mechanism, "resourceReserveFraction": 0.15,
+            "expectedCurse": expected_curse,
+            "curseSelectionReason": "explicitly requested" if requested_curses else "damage-type-compatible default",
+            "archetype": archetype,
             "budgetChaos": budget_from_prompt(prompt, market["divineChaos"]), "weaponType": weapon,
             "weaponTypes": allowed_weapon_types,
             "utility": utility, "noUniques": bool(re.search(
@@ -375,6 +395,20 @@ def assess_mechanics(spec: dict, calculation: dict, profile: dict, xml: str,
         checks.append({"name": "Temporary weapon population modeled", "passed": count > 0 and sustained,
                        "reason": f"Sustainable estimated animated weapons: {count}" if sustained else
                        "No sustainable Animate Weapon population could be established from cast rate, duration, mana or life sustain"})
+    expected_curse = spec.get("expectedCurse")
+    if expected_curse:
+        checks.append({"name": "Mechanism-matched curse equipped",
+                       "passed": expected_curse in spec.get("utility", {}),
+                       "reason": (f"{expected_curse} is socketed for the {spec.get('damageMechanism', 'selected')} damage plan; curse uptime is not assumed"
+                                  if expected_curse in spec.get("utility", {}) else
+                                  f"The selected damage plan requires {expected_curse} in a utility socket")})
+    resource_plan = sustained_resource_use(stats, spec)
+    if resource_plan is not None and (resource_plan.get("checks") or "population" in resource_plan):
+        checks.append({"name": "Main-skill sustain leaves utility reserve",
+                       "passed": bool(resource_plan.get("sustainable")),
+                       "reason": (f"Main-skill use is covered after reserving {spec.get('resourceReserveFraction', 0.15):.0%} of regeneration for utility casts"
+                                  if resource_plan.get("sustainable") else
+                                  "Main-skill use exceeds recovery after the utility-cast reserve")})
     return checks
 
 
@@ -545,6 +579,141 @@ def support_candidate_shortlist(identifiers, data: GameData, spec: dict, limit: 
 
     return sorted(set(identifiers), key=lambda identifier: (-relevance(identifier)[0],
                                                             relevance(identifier)[1], identifier))[:limit]
+
+
+def support_mechanism_compatible(gem: dict, spec: dict) -> bool:
+    """Do not mix poison supports into an explicitly non-poison damage plan."""
+    name = gem.get("name", "").casefold()
+    poison_support = "poison" in name or bool(gem.get("tags", {}).get("poison"))
+    mechanism = spec.get("damageMechanism", "")
+    if poison_support and mechanism not in {"poison", "minion_chaos_poison"}:
+        return False
+    return True
+
+
+def clear_coverage_role(name: str) -> str | None:
+    """Classify common clear supports separately from their single-target DPS."""
+    normalized = name.casefold()
+    if any(term in normalized for term in ("splash", "increased area of effect", "ignite proliferation",
+                                            "burning proliferation", "area of effect")):
+        return "area coverage"
+    if any(term in normalized for term in ("chain", "fork", "multiple projectile", "pierce", "volley")):
+        return "projectile or target coverage"
+    return None
+
+
+def mapping_support_plan(trace: list, supports: list[str]) -> dict:
+    """Expose clear-oriented candidates beside the single-target link score."""
+    integrated = sorted({name for name in supports if clear_coverage_role(name)})
+    alternatives = {}
+    for event in trace:
+        if event.get("kind") != "support_selection" or not event.get("selected"):
+            continue
+        boss = next((entry for entry in event.get("candidates", [])
+                     if entry.get("name") == event["selected"] and entry.get("feasible")), None)
+        if not boss:
+            continue
+        best_damage = max(0.0, float(boss.get("sustainedDamage", boss.get("damage", 0)) or 0))
+        if best_damage <= 0:
+            continue
+        for candidate in event.get("candidates", []):
+            role = clear_coverage_role(candidate.get("name", ""))
+            if not role or not candidate.get("feasible") or candidate["name"] in supports:
+                continue
+            damage = max(0.0, float(candidate.get("sustainedDamage", candidate.get("damage", 0)) or 0))
+            retention = damage / best_damage
+            current = alternatives.get(candidate["name"])
+            if retention >= 0.5 and (current is None or retention > current["singleTargetRetention"]):
+                alternatives[candidate["name"]] = {
+                    "support": candidate["name"], "role": role,
+                    "screeningSocket": event.get("link_index"),
+                    "comparedWith": event["selected"],
+                    "singleTargetRetention": round(retention, 3),
+                    "sustainability": candidate.get("sustainability"),
+                }
+    return {"bossLink": list(supports), "integratedCoverageSupports": integrated,
+            "mappingAlternatives": sorted(alternatives.values(),
+                                           key=lambda entry: (-entry["singleTargetRetention"], entry["support"]))[:5],
+            "coverageModel": "Area and targeting roles are listed separately; their encounter coverage is not converted into single-target DPS."}
+
+
+def sustained_damage_value(stats: dict, spec: dict) -> float:
+    """Compare actual damage after cast-resource coverage and summon population."""
+    resource = sustained_resource_use(stats, spec)
+    damage = target_dps(recounted_stats(stats, spec), spec)
+    if resource is None:
+        return damage
+    if "population" in resource and not resource.get("sustainable"):
+        return 0.0
+    checks = resource.get("checks", [])
+    if not checks:
+        return damage
+    coverage = min(max(0.0, float(check.get("availablePerSecond", 0) or 0)) /
+                   max(0.1, float(check.get("usePerSecond", 0) or 0)) for check in checks)
+    return damage * min(1.0, coverage)
+
+
+def support_gain_is_meaningful(baseline: float, candidate: float, minimum_gain: float = 0.005) -> bool:
+    """Ignore support socket changes whose measured damage gain is within noise."""
+    baseline, candidate = max(0.0, float(baseline)), max(0.0, float(candidate))
+    return candidate > baseline * (1 + minimum_gain) if baseline else candidate > 0
+
+
+def search_curse(spec: dict, data: GameData, render, worker, baseline: dict,
+                 budget: SearchBudget | None = None, trace: list | None = None) -> dict:
+    """Score compatible offensive curse choices using the installed PoB calculation."""
+    current = spec.get("expectedCurse")
+    if not current or any(data.gems.get(name, {}).get("tags", {}).get("curse")
+                          for name in spec.get("requestedUtilities", [])):
+        return baseline
+    slot = spec.get("utility", {}).get(current)
+    if not slot:
+        return baseline
+    preferred = {"fire": "Flammability", "cold": "Frostbite", "lightning": "Conductivity",
+                 "chaos": "Despair", "physical": "Vulnerability"}.get(spec.get("damageType"), "Vulnerability")
+    candidates = [preferred, "Despair", "Vulnerability", "Elemental Weakness",
+                  "Flammability", "Frostbite", "Conductivity"]
+    candidates = list(dict.fromkeys(name for name in candidates if name in data.gems and
+                                    data.gem(name)["tags"].get("curse")))
+    baseline_score = sustained_damage_value(baseline.get("stats", {}), spec)
+    best = {"name": current, "score": baseline_score, "calc": baseline}
+    evaluated = [{"name": current, "damage": baseline_score, "selected": False}]
+    original_utility = dict(spec.get("utility", {}))
+    for name in candidates:
+        if name == current:
+            continue
+        if budget is not None and not budget.claim(reserve=200):
+            break
+        spec["utility"] = {key: value for key, value in original_utility.items() if key != current}
+        spec["utility"][name] = slot
+        spec["expectedCurse"] = name
+        candidate = worker.request("calculate", xml=render())
+        stats = candidate.get("stats", {})
+        score_value = sustained_damage_value(stats, spec) if candidate.get("calculated") else 0
+        payable = stats.get("ManaUnreserved", 0) >= stats.get("ManaCost", 0)
+        evaluated.append({"name": name, "damage": score_value, "payable": payable,
+                          "selected": False})
+        if payable and candidate.get("calculated") and score_value > best["score"] * 1.005:
+            best = {"name": name, "score": score_value, "calc": candidate}
+    spec["utility"] = original_utility
+    spec["expectedCurse"] = current
+    if best["name"] != current:
+        spec["utility"] = {key: value for key, value in original_utility.items() if key != current}
+        spec["utility"][best["name"]] = slot
+        spec["expectedCurse"] = best["name"]
+        spec["curseSelectionReason"] = "PoB measured damage with this curse in the selected utility slot"
+    else:
+        spec["curseSelectionReason"] = "Damage-type-compatible curse retained after PoB comparison"
+    for entry in evaluated:
+        entry["selected"] = entry["name"] == best["name"]
+    if trace is not None:
+        trace.append({"kind": "curse_selection", "slot": slot,
+                      "damageMechanism": spec.get("damageMechanism"),
+                      "candidates": evaluated, "selected": best["name"],
+                      "reason": ("highest PoB-measured, resource-adjusted damage; curse uptime is not assumed"
+                                 if best["name"] != current else
+                                 "no alternative curse improved measured damage by at least 0.5%")})
+    return best["calc"]
 
 
 def support_refinement_order(identifiers, data: GameData, initial_candidates=(), limit: int = 24) -> list[str]:
@@ -742,19 +911,7 @@ def choose_support_candidate(feasible: list[dict], spec: dict) -> tuple[dict, di
     sustainability_acceptable = bool(sustainable) and sustain_best >= damage_best * sustain_damage_floor
     selection_pool = sustainable if sustainability_acceptable else feasible
     def sustained_damage(entry):
-        damage = target_dps(recounted_stats(entry["stats"], spec), spec)
-        resource = sustainability[entry["id"]]
-        if not resource or resource.get("sustainable"):
-            return damage
-        # If no support keeps repeated casting fully sustainable, estimate
-        # long-run damage from the fraction of resource use covered by recovery.
-        # Temporary summons already have their population-scaled damage.
-        checks = resource.get("checks", [])
-        if not checks:
-            return damage
-        coverage = min(max(0.0, check["availablePerSecond"]) /
-                       max(0.1, check["usePerSecond"]) for check in checks)
-        return damage * min(1.0, coverage)
+        return sustained_damage_value(entry["stats"], spec)
 
     best = max(selection_pool, key=lambda entry: (
         sustained_damage(entry), target_dps(recounted_stats(entry["stats"], spec), spec), entry["id"]))
@@ -770,6 +927,7 @@ def search_links(spec, data, render, worker, stage, trace=None, budget=None):
         for identifier in candidates:
             gem = data.by_id.get(identifier)
             if (gem and gem["name"] not in supports and not gem["name"].startswith("Awakened ")
+                    and support_mechanism_compatible(gem, spec)
                     and gem["name"] not in {"Sacrifice", "Vaal Sacrifice", "Cast on Death"}
                     and (gem["name"] != "Decay" or spec["archetype"] == "dot")
                     and not gem["tags"].get("exceptional") and gem["maxLevel"] >= 20):
@@ -813,6 +971,7 @@ def search_links(spec, data, render, worker, stage, trace=None, budget=None):
                           "shortlistedCandidates": len(scored),
                           "candidates": [{"name": data.by_id.get(entry["id"], {}).get("name", entry["id"]),
                                           "damage": target_dps(recounted_stats(entry["stats"], spec), spec),
+                                          "sustainedDamage": sustained_damage_value(entry["stats"], spec),
                                           "feasible": entry in feasible,
                                           "sustainability": sustainability.get(entry["id"])} for entry in scored],
                           "sustainableCandidates": sum(bool(result and result["sustainable"])
@@ -821,13 +980,21 @@ def search_links(spec, data, render, worker, stage, trace=None, budget=None):
                                             if sustainability_acceptable else
                                             "highest resource-adjusted long-run damage among one-use feasible candidates"),
                           "selected": data.by_id[best["id"]]["name"]})
-        # Fill a legal five-link even if the fourth support is chiefly utility.
-        if len(supports) >= 4 and target_dps(recounted_stats(best["stats"], spec), spec) <= target_dps(
-                recounted_stats(baseline, spec), spec):
+        baseline_sustained = sustained_damage_value(baseline, spec)
+        candidate_sustained = sustained_damage_value(best["stats"], spec)
+        # Avoid padding a link with compatible gems whose measured gain is
+        # below noise. Keep earlier useful links and let diagnostics report
+        # their actual size instead of pretending the socket count adds value.
+        if not support_gain_is_meaningful(baseline_sustained, candidate_sustained):
+            if trace is not None:
+                trace.append({"kind": "support_selection", "link_index": index + 1,
+                              "selected": None, "baselineSustainedDamage": baseline_sustained,
+                              "bestCandidateSustainedDamage": candidate_sustained,
+                              "reason": "no compatible support improved resource-adjusted damage by at least 0.5%"})
             break
         supports.append(data.by_id[best["id"]]["name"])
-    if len(supports) < 4:
-        raise ValueError(f"PoB could not construct a compatible five-link for {spec['skill']}")
+    if not supports:
+        raise ValueError(f"PoB found no meaningful resource-adjusted support for {spec['skill']}")
     return supports
 
 
@@ -1760,6 +1927,8 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                             trace=trace, budget=budget)
     if budget.claim():
         calc = worker.request("calculate", xml=render())
+    stage("Comparing damage-appropriate curses in Path of Building")
+    calc = search_curse(spec, data, render, worker, calc, budget, trace)
     # Support requirements can add attributes; repair them before evaluating
     # passive overrides so every tree candidate uses legal final links.
     for _ in range(3):
@@ -2129,6 +2298,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                                          [all_rare_seed, *pair_design_seeds])
     allocated = best_design["nodes"]
     supports = best_design["supports"]
+    spec["mappingSupportPlan"] = mapping_support_plan(trace or [], supports)
     items = best_design["items"]
     masteries = best_design["masteries"]
     uniques = best_design["uniques"]
@@ -2241,13 +2411,20 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
               "changedSlots": ([item.slot for item in items if not item.slot.startswith("Flask ")] +
                                [slot for slot in uniques if slot.startswith("Flask ")]),
               "masteries": masteries, "modelReason": "Generated and scored in real PoB; rare templates and gems remain unpriced.",
-              "mechanics": {**profile, "damageType": spec["damageType"]},
+              "mechanics": {**profile, "damageType": spec["damageType"],
+                            "damageMechanism": spec.get("damageMechanism")},
+              "resourcePlan": {"reserveFraction": spec.get("resourceReserveFraction", 0.15),
+                               "purpose": "Reserve part of calculated recovery for movement, curses and other utility casts",
+                               "sustain": sustained_resource_use(calc.get("stats", {}), spec)},
+              "mappingPlan": spec.get("mappingSupportPlan", mapping_support_plan(trace or [], supports)),
               "selectionReasons": {"ascendancy": ("Selected from the requested skill tags and explicit prompt choices" +
                                                      (": " + ", ".join(selected_ascendancy) if selected_ascendancy else ".")),
                                    "passives": "PoB-calculated candidate gains; neutral leaves pruned; " + passive_reason,
                                    "importantPassives": important_passives[:12],
                                    "utility": ([spec["resourceUtilityReason"]]
                                                if spec.get("resourceUtilityReason") else []),
+                                   "curse": ([f"{expected_curse} selected: {spec.get('curseSelectionReason', 'damage-type-compatible curse')}; ongoing uptime is not assumed"]
+                                             if (expected_curse := spec.get("expectedCurse")) else []),
                                    "uniques": unique_selection_reasons,
                                    "jewels": [f"Rare jewel selected in passive socket {node} after PoB scoring"
                                               for node in sorted(jewels, key=int)]},
