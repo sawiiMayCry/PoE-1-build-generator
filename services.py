@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from pob_engine import find_pob_installation
+from pob_engine import find_pob_installation, get_worker
 
 _cache: dict[str, tuple[float, object]] = {}
 _lock = threading.Lock()
@@ -30,6 +30,70 @@ def fetch(url: str, *, data: bytes | None = None, timeout: int = 20,
 
 def json_get(url: str) -> dict | list:
     return json.loads(fetch(url, headers={"Accept": "application/json"}))
+
+
+def _normalize_lines(lines):
+    return " ".join(" ".join(str(line).split()) for line in (lines or []))
+
+
+def compare_tree_metadata(official_nodes: dict, installed: dict, ascendancies: set[str] | None = None) -> dict:
+    """Compare the official node graph and mastery definitions with installed PoB."""
+    ascendancies = ascendancies or set()
+
+    def relevant(node):
+        ascendancy = node.get("ascendancyName")
+        return (not node.get("isProxy") and not node.get("isBloodline") and
+                (ascendancy is None or ascendancy in ascendancies))
+
+    official = {str(key): value for key, value in official_nodes.items()
+                if str(key).isdigit() and isinstance(value, dict) and value.get("group") is not None
+                and relevant(value)}
+    all_local = {str(key): value for key, value in installed.get("nodes", {}).items() if relevant(value)}
+    orphan_extras = sorted((key for key, node in all_local.items()
+                            if key not in official and not node.get("links")), key=int)
+    local = {key: value for key, value in all_local.items() if key not in orphan_extras}
+    missing = sorted(set(official) - set(local), key=int)
+    extra = sorted(set(local) - set(official), key=int)
+
+    def links(nodes):
+        result = {}
+        for key, node in nodes.items():
+            neighbors = set(map(str, node.get("out", []))) | set(map(str, node.get("in", []))) \
+                if "out" in node or "in" in node else set(map(str, node.get("links", [])))
+            result[key] = {neighbor for neighbor in neighbors if neighbor in nodes and neighbor != key}
+        return result
+
+    official_links, local_links = links(official), links(local)
+    connection_mismatches = [key for key in sorted(set(official) & set(local), key=int)
+                             if official_links[key] != local_links[key]]
+    official_effects = {}
+    for node in official.values():
+        for effect in node.get("masteryEffects", []):
+            effect_id = str(effect.get("effect", effect.get("id", "")))
+            if effect_id:
+                official_effects[effect_id] = {"name": effect.get("name"),
+                                               "stats": _normalize_lines(effect.get("stats", []))}
+    local_effects = {}
+    relevant_effect_ids = {str(effect_id) for node in local.values()
+                           for effect_id in node.get("masteryEffects", [])}
+    for key, value in installed.get("masteryEffects", {}).items():
+        if str(key) not in relevant_effect_ids:
+            continue
+        if isinstance(value, list):
+            local_effects[str(key)] = {"name": None, "stats": _normalize_lines(value)}
+        elif isinstance(value, dict):
+            local_effects[str(key)] = {"name": value.get("name"),
+                                       "stats": _normalize_lines(value.get("stats", []))}
+    mastery_mismatches = sorted(key for key in set(official_effects) | set(local_effects)
+                                if official_effects.get(key) != local_effects.get(key))
+    return {"passed": not (missing or extra or connection_mismatches or mastery_mismatches),
+            "officialNodeCount": len(official), "installedNodeCount": len(local),
+            "missingNodeIds": missing[:30], "extraNodeIds": extra[:30],
+            "ignoredOrphanNodeIds": orphan_extras[:30],
+            "connectionMismatchCount": len(connection_mismatches),
+            "connectionMismatchNodeIds": connection_mismatches[:30],
+            "masteryMismatchCount": len(mastery_mismatches),
+            "masteryMismatchEffectIds": mastery_mismatches[:30]}
 
 
 def cached(key: str, ttl: int, loader):
@@ -71,11 +135,24 @@ def game_context() -> dict:
         league = leagues[0].get("id") or leagues[0].get("name")
         if not league:
             raise RuntimeError("Active trade league has no ID")
-        tree = json_get("https://raw.githubusercontent.com/grindinggear/skilltree-export/master/data.json")
+        tree_url = ("https://raw.githubusercontent.com/grindinggear/skilltree-export/"
+                    + urllib.parse.quote(tag, safe="") + "/data.json")
+        tree = json_get(tree_url)
         if not isinstance(tree.get("nodes"), dict) or len(tree["nodes"]) < 1000:
             raise RuntimeError("Official passive tree data is unavailable")
+        app_root = Path(__file__).resolve().parent
+        installed_tree = get_worker(app_root, app_root / "data").request("treeMetadata")
+        if installed_tree.get("version") != local_tree:
+            raise RuntimeError(f"Installed PoB loaded tree {installed_tree.get('version')}, expected {local_tree}.")
+        witch = next((entry for entry in tree.get("classes", []) if entry.get("name") == "Witch"), {})
+        ascendancies = {entry.get("name") for entry in witch.get("ascendancies", []) if entry.get("name")}
+        consistency = compare_tree_metadata(tree["nodes"], installed_tree, ascendancies)
+        if not consistency["passed"]:
+            raise RuntimeError("Official passive tree differs from installed PoB: " +
+                               json.dumps(consistency, separators=(",", ":")))
         return {"league": league, "leagueName": leagues[0].get("name", league),
                 "treeVersion": local_tree, "officialRelease": tag, "tree": tree,
+                "treeSource": tree_url, "treeConsistency": consistency,
                 "pobHome": home, "checkedAt": int(time.time())}
     return cached("game-context", 900, load)
 
@@ -90,6 +167,7 @@ def market_data(league: str) -> dict:
         if not divine or float(divine) <= 0:
             raise RuntimeError("Current divine to chaos conversion is unavailable")
         prices: dict[str, list[float]] = {}
+        listings: dict[str, list[dict]] = {}
         errors = []
         for kind in ("UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueFlask", "UniqueJewel"):
             try:
@@ -98,9 +176,15 @@ def market_data(league: str) -> dict:
                     name, value = line.get("name"), line.get("chaosValue")
                     if name and value and float(value) > 0:
                         prices.setdefault(name, []).append(float(value))
+                        listings.setdefault(name, []).append({
+                            "chaos": float(value),
+                            "variant": line.get("variant") or line.get("variantName"),
+                            "links": line.get("links") or line.get("linkCount"),
+                            "detailsId": line.get("detailsId"),
+                        })
             except Exception as exc:
                 errors.append(f"{kind}: {exc}")
-        return {"league": league, "divineChaos": float(divine), "prices": prices,
+        return {"league": league, "divineChaos": float(divine), "prices": prices, "listings": listings,
                 "updated": int(time.time()), "source": "poe.ninja economy API", "errors": errors}
     return cached("market:" + league, 300, load)
 
@@ -132,7 +216,19 @@ def publish(code: str, decoder, expected_fingerprint: str, fingerprint) -> str:
         raw = fetch("https://pobb.in/pob/", data=code.encode("ascii"), timeout=30,
                     headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "text/plain"})
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"pobb.in rejected the export (HTTP {exc.code}); retry sharing later") from exc
+        detail = exc.read(1024).decode("utf-8", errors="replace").strip()
+        if detail.startswith("{"):
+            try:
+                error = json.loads(detail)
+                detail = error.get("message") or error.get("error") or ""
+            except (ValueError, AttributeError):
+                detail = ""
+        if not isinstance(detail, str) or "<" in detail:
+            detail = ""
+        detail = re.sub(r"\s+", " ", detail)[:240]
+        message = (f"pobb.in rejected the build format (HTTP {exc.code})" if exc.code == 400 else
+                   f"pobb.in rejected the export (HTTP {exc.code}); retry sharing later")
+        raise RuntimeError(message + (": " + detail if detail else "")) from exc
     value = raw.decode("utf-8", errors="replace").strip()
     match = re.fullmatch(r"(?:https?://(?:www\.)?pobb\.in/)?([A-Za-z0-9_-]{4,32})/?", value)
     if not match:

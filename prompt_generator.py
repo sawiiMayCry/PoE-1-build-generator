@@ -1,8 +1,7 @@
-"""Turn a freeform request into a locally planned, PoB-validated Witch export.
+"""Public clean-generation entry point and legacy reference benchmark helpers.
 
-Ollama chooses a current PoB skill core and concrete tree, support and gear
-changes. Every identifier it may use comes from current official tree data or
-real current-version PoBs; the model cannot write arbitrary PoB XML.
+generate() delegates to real_generator; reference helpers are retained for
+regressions and comparisons and are never used as generation fallbacks.
 """
 from __future__ import annotations
 
@@ -502,7 +501,7 @@ def _validate_candidate(pattern: dict, action: dict, tree_options: list[dict], s
     return xml, recipe, checks, details, calculation, price
 
 
-def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
+def _legacy_reference_generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
     prompt = str(request.get("prompt", "")).strip()
     if not 12 <= len(prompt) <= 2000:
         raise ValueError("Describe the Witch build you want in 12 to 2,000 characters.")
@@ -577,3 +576,9 @@ def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
     if failures and ("No current validated Witch pattern" in failures[-1] or "No current Witch PoB pattern" in failures[-1]):
         raise ValueError(failures[-1])
     raise ValueError("The local model could not make a valid build for this prompt. " + " | ".join(failures[-3:])[:1200])
+
+
+def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
+    """Public entry point: generate mechanics from installed data, never a donor."""
+    from real_generator import generate as generate_from_data
+    return generate_from_data(request, app_root, data_root, stage)

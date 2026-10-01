@@ -8,6 +8,7 @@ import secrets
 import socket
 import threading
 import urllib.error
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -15,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from build_generator import decode_pob, encode_pob, mechanics_fingerprint, validate_calculation
 from prompt_generator import generate
 from ollama_service import DEFAULT_MODEL, models
-from pob_engine import calculate_with_pob, engine_status
+from pob_engine import calculate_with_pob, engine_status, export_with_pob
 from services import game_context, market_data, publish
 
 ROOT = Path(__file__).resolve().parent
@@ -214,11 +215,20 @@ class Handler(BaseHTTPRequestHandler):
                 xml = decode_pob(encode_pob(build["_xml"]))
                 if mechanics_fingerprint(xml) != build["_fingerprint"]:
                     raise RuntimeError("Saved build mechanics changed; regenerate")
-                calculation = calculate_with_pob(xml, ROOT, DATA)
+                # Repair saved minimal candidates from before normal PoB export.
+                if not ET.fromstring(xml).findall("./Build/PlayerStat"):
+                    calculation = export_with_pob(xml, ROOT, DATA)
+                    xml = calculation.pop("xml")
+                else:
+                    calculation = calculate_with_pob(xml, ROOT, DATA)
                 failed = [check for check in validate_calculation(calculation) if not check["passed"]]
                 if failed:
                     raise RuntimeError("Saved export no longer passes validation; regenerate. " +
                                        "; ".join(check["reason"] for check in failed))
+                build["_xml"] = xml
+                build["_fingerprint"] = mechanics_fingerprint(xml)
+                build["stats"] = calculation["stats"]
+                build["pobVersion"] = calculation.get("version")
                 try:
                     build["shareUrl"] = publish(encode_pob(xml), decode_pob,
                                                 build["_fingerprint"], mechanics_fingerprint)

@@ -1,4 +1,5 @@
 __pycache__/
+.pytest_cache/
 *.pyc
 data/
 .env
@@ -6,3 +7,4 @@ data/
 *.log
 server_legacy.py
 app_legacy.jsx
+acceptance/
