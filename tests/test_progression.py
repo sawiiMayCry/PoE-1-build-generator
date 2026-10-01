@@ -22,6 +22,37 @@ Granite Flask</Item><ItemSet id="1"><Slot name="Flask 2" itemId="1" active="fals
         self.assertEqual(slots["Flask 2"], "1")
         self.assertIn("Rumi's Concoction", root.find("./Items/Item[@id='1']").text)
 
+    def test_add_flasks_repairs_zero_and_unresolved_slot_ids(self):
+        root = ET.fromstring('''<PathOfBuilding><Items activeItemSet="1">
+          <Item id="1">Rarity: UNIQUE\nRumi's Concoction\nGranite Flask</Item>
+          <ItemSet id="1"><Slot name="Flask 1" itemId="0"/>
+          <Slot name="Flask 2" itemId="404"/><Slot name="Flask 3" itemId="1"/></ItemSet>
+        </Items></PathOfBuilding>''')
+        data = GameData({"gems": [], "mods": [], "bases": {
+            name: {"type": "Flask", "req": {"level": 1}}
+            for name in ("Greater Life Flask", "Greater Mana Flask", "Quicksilver Flask",
+                         "Granite Flask", "Quartz Flask")}})
+        add_flasks(root, data, 80)
+        items = {item.get("id"): item for item in root.findall("./Items/Item")}
+        slots = {slot.get("name"): slot.get("itemId") for slot in root.findall("./Items/ItemSet/Slot")}
+        self.assertEqual(set(slots), {f"Flask {index}" for index in range(1, 6)})
+        for index in range(1, 6):
+            self.assertIn(slots[f"Flask {index}"], items)
+        self.assertEqual(slots["Flask 3"], "1")
+
+    def test_stage_checks_require_five_resolved_level_legal_flasks(self):
+        data = GameData({"gems": [], "bases": {"Granite Flask": {"type": "Flask", "req": {"level": 1}}},
+                         "mods": []})
+        xml = '''<PathOfBuilding><Build/><Tree><Spec nodes="1"/></Tree><Skills><SkillSet><Skill/></SkillSet></Skills>
+          <Items activeItemSet="1"><Item id="1">Rarity: NORMAL\nGranite Flask</Item>
+          <ItemSet id="1"><Slot name="Flask 1" itemId="1"/><Slot name="Flask 2" itemId="0"/></ItemSet></Items>
+          <Config><ConfigSet/></Config></PathOfBuilding>'''
+        calc = {"stats": {}, "passives": {"used": 0, "ascendancy": 0}, "calculated": False}
+        checks = stage_checks(xml, {**milestones(90)[-1], "resistanceTarget": 0}, calc, data,
+                              {"tree": {"nodes": {"1": {"classStartIndex": 3}}}})
+        flask_check = next(check for check in checks if check["name"] == "Five equipped flasks")
+        self.assertFalse(flask_check["passed"])
+
     def test_act_budgets_penalties_and_lab_unlocks(self):
         phases = milestones(89)
         self.assertEqual(len(phases), 13)
@@ -112,7 +143,8 @@ Granite Flask</Item><ItemSet id="1"><Slot name="Flask 2" itemId="1" active="fals
                          "bases": {"Simple Robe": {"req": {"level": 1}}}, "mods": []})
         xml = '''<PathOfBuilding><Build mainSocketGroup="1"/><Tree activeSpec="1"><Spec nodes="1"/></Tree>
           <Skills activeSkillSet="1"><SkillSet id="1"><Skill slot="Body Armour"><Gem gemId="Fireball" nameSpec="Fireball" level="1"/></Skill>
-          <Skill><Gem skillId="PrimalAegis" nameSpec="" level="20"/></Skill></SkillSet></Skills>
+          <Skill><Gem skillId="PrimalAegis" nameSpec="" level="20"/></Skill></SkillSet>
+          <SkillSet id="2"><Skill><Gem gemId="Fireball" nameSpec="Fireball" level="20"/></Skill></SkillSet></Skills>
           <Items activeItemSet="1"><Item id="1">Rarity: NORMAL
 Simple Robe
 Sockets: B</Item><ItemSet id="1"><Slot name="Body Armour" itemId="1"/></ItemSet></Items></PathOfBuilding>'''

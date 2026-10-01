@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from build_assembly import assemble
-from build_progression import add_progression
+from build_progression import add_progression, flasks_complete
 from build_generator import (_item_parts, mechanics_fingerprint, offense_value, quote,
                              validate_calculation, validate_structure)
 from generation_data import (GameData, RareItem, base_required_level, rare_templates,
@@ -2192,6 +2192,8 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
         progression[-1]["passives"] = final.get("passives", {}).get("used", 0)
     calc = final
     structural, details = validate_structure(xml, context, spec["ascendancy"], spec["skill"])
+    structural.append({"name": "Five equipped flasks", "passed": flasks_complete(xml, data, spec["level"]),
+                       "reason": "The active exported endgame item set must resolve five level-legal flask items"})
     if any(not check["passed"] for check in structural):
         raise ValueError("Complete build failed final structural validation")
     final_calculation_checks = validate_calculation(calc)

@@ -105,9 +105,12 @@ def add_flasks(root, data, level: int):
     active = equipment.get("activeItemSet")
     item_set = next(entry for entry in equipment.findall("ItemSet") if entry.get("id") == active)
     next_id = max((int(item.get("id")) for item in equipment.findall("Item")), default=0)
+    items = {item.get("id"): item for item in equipment.findall("Item")}
     for index, kind in enumerate(("Life", "Mana", "Quicksilver", "Granite", "Quartz"), 1):
         slot_name = f"Flask {index}"
-        if any(slot.get("name") == slot_name for slot in item_set.findall("Slot")):
+        slot = next((entry for entry in item_set.findall("Slot") if entry.get("name") == slot_name), None)
+        equipped = items.get(slot.get("itemId")) if slot is not None else None
+        if equipped is not None and _item_parts(equipped.text)[2] in data.bases and data.bases[_item_parts(equipped.text)[2]]["type"] == "Flask":
             continue
         choices = [(name, base) for name, base in data.bases.items() if base["type"] == "Flask"
                    and (name.endswith(" Life Flask") if kind == "Life" else
@@ -120,8 +123,34 @@ def add_flasks(root, data, level: int):
             raise ValueError("Installed flask definitions are missing")
         name, base = max(choices, key=lambda row: (base_required_level(row[1]), row[0]))
         next_id += 1
-        ET.SubElement(equipment, "Item", id=str(next_id)).text = f"Rarity: NORMAL\n{name}\nQuality: 0"
-        ET.SubElement(item_set, "Slot", name=slot_name, itemId=str(next_id), active="false")
+        flask = ET.SubElement(equipment, "Item", id=str(next_id))
+        flask.text = f"Rarity: NORMAL\n{name}\nQuality: 0"
+        items[str(next_id)] = flask
+        if slot is None:
+            ET.SubElement(item_set, "Slot", name=slot_name, itemId=str(next_id), active="false")
+        else:
+            slot.set("itemId", str(next_id))
+
+
+def flasks_complete(xml: str, data, level: int) -> bool:
+    root = ET.fromstring(xml)
+    equipment = root.find("Items")
+    if equipment is None:
+        return False
+    active = equipment.get("activeItemSet")
+    item_set = next((entry for entry in equipment.findall("ItemSet") if entry.get("id") == active), None)
+    if item_set is None:
+        return False
+    items = {item.get("id"): item for item in equipment.findall("Item")}
+    slots = {slot.get("name"): slot for slot in item_set.findall("Slot")}
+    for index in range(1, 6):
+        item = items.get(slots.get(f"Flask {index}").get("itemId")) if slots.get(f"Flask {index}") is not None else None
+        if item is None:
+            return False
+        base = _item_parts(item.text)[2]
+        if base not in data.bases or data.bases[base]["type"] != "Flask" or base_required_level(data.bases[base]) > level:
+            return False
+    return True
 
 
 def combine_loadouts(documents: list[str], phases: list[dict], notes: str) -> str:
@@ -189,11 +218,20 @@ def select_stage(xml: str, index: int, level: int) -> str:
 def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]:
     root = ET.fromstring(xml)
     output = calc["stats"]
-    nodes = {node for node in root.find("./Tree/Spec").get("nodes", "").split(",") if node}
+    tree = root.find("Tree")
+    specs = tree.findall("Spec") if tree is not None else []
+    active_spec = tree.get("activeSpec", "1") if tree is not None else "1"
+    spec = specs[int(active_spec) - 1] if active_spec.isdigit() and 0 < int(active_spec) <= len(specs) else (specs[0] if specs else None)
+    nodes = {node for node in spec.get("nodes", "").split(",") if node} if spec is not None else set()
     budget = phase["level"] - 1 + phase["questPoints"] + max(0, output.get("ExtraPoints", 1) - 1)
+    skill_container = root.find("Skills")
+    active_skill_set = skill_container.get("activeSkillSet") if skill_container is not None else None
+    active_skills = next((entry for entry in root.findall("./Skills/SkillSet")
+                          if entry.get("id") == active_skill_set), None)
     valid_gems = all(any(entry["level"] == int(gem.get("level")) and entry["requiredLevel"] <= phase["level"]
                          for entry in data.gem(gem.get("nameSpec"))["levels"])
-                     for gem in root.findall("./Skills/SkillSet/Skill/Gem") if gem.get("gemId"))
+                     for gem in (active_skills.findall("./Skill/Gem") if active_skills is not None else [])
+                     if gem.get("gemId"))
     ids = {item.get("id"): item for item in root.findall("./Items/Item")}
     item_container = root.find("Items")
     active_item_set = item_container.get("activeItemSet") if item_container is not None else None
@@ -208,13 +246,10 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
             continue
         _, _, base = _item_parts(item.text)
         valid_items = valid_items and base in data.bases and base_required_level(data.bases[base]) <= phase["level"]
+    complete_flasks = flasks_complete(xml, data, phase["level"])
     _, main, _ = _main_group(root)
     links = len(main.findall("Gem"))
     counts = {}
-    skill_container = root.find("Skills")
-    active_skill_set = skill_container.get("activeSkillSet") if skill_container is not None else None
-    active_skills = next((entry for entry in root.findall("./Skills/SkillSet")
-                          if entry.get("id") == active_skill_set), None)
     for group in active_skills.findall("Skill") if active_skills is not None else []:
         socketed = sum(bool(gem.get("gemId")) for gem in group.findall("Gem"))
         if socketed:
@@ -250,6 +285,7 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
         ("Connected stage tree", connected),
         ("Stage gem levels", valid_gems),
         ("Stage equipment levels", valid_items),
+        ("Five equipped flasks", complete_flasks, "Each active stage must resolve five level-legal flask items"),
         ("Stage sockets", socket_ok,
          f"{phase['title']}; main link {links}/{phase['links']}; groups {counts}; "
          f"available sockets {available_sockets}"),
@@ -420,6 +456,10 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
         # PoB's first save materializes default combat placeholders. Score and
         # summarize the saved stage that will actually be merged/shared.
         calc = worker.request("calculate", xml=export["xml"])
+        checks = stage_checks(export["xml"], phase, calc, data, context)
+        failures = [check["name"] for check in checks if not check["passed"]]
+        if failures:
+            raise ValueError(phase["title"] + " failed saved-export validation: " + ", ".join(failures))
         gear = []
         for item in document.findall("./Items/Item"):
             _, _, base = _item_parts(item.text)
@@ -443,17 +483,17 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
     for index, summary in enumerate(summaries, 1):
         selected_xml = select_stage(xml, index, summary["level"])
         calc = worker.request("calculate", xml=selected_xml)
+        merged_checks = stage_checks(selected_xml, summary, calc, data, context)
+        failures = [entry["name"] for entry in merged_checks if not entry["passed"]]
+        if failures:
+            raise ValueError("Merged loadout made " + summary["title"] +
+                             " invalid: " + ", ".join(
+                                 entry["name"] + ": " + entry["reason"]
+                                 for entry in merged_checks if not entry["passed"]))
         if calc["stats"] != summary["stats"] or calc["passives"]["used"] != summary["passives"]:
             changed = {key: {"stage": summary["stats"].get(key), "merged": calc["stats"].get(key)}
                        for key in set(summary["stats"]) | set(calc["stats"])
                        if summary["stats"].get(key) != calc["stats"].get(key)}
-            merged_checks = stage_checks(selected_xml, summary, calc, data, context)
-            failures = [entry["name"] for entry in merged_checks if not entry["passed"]]
-            if failures:
-                raise ValueError("Merged loadout made " + summary["title"] +
-                                 " invalid: " + ", ".join(
-                                     entry["name"] + ": " + entry["reason"]
-                                     for entry in merged_checks if not entry["passed"]))
             # Use the actual merged loadout's PoB calculation as authoritative;
             # configurations can materialize default combat placeholders only
             # when the named loadouts are combined.
