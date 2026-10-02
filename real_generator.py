@@ -9,7 +9,7 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from build_assembly import assemble
+from build_assembly import assemble, disable_conditional_item_skill_groups
 from build_progression import add_progression, flasks_complete
 from build_generator import (_item_parts, mechanics_fingerprint, offense_value, quote,
                              validate_calculation, validate_structure)
@@ -24,6 +24,95 @@ from pob_engine import close_worker, export_with_pob, get_worker
 from services import game_context, market_data
 
 FINAL_REFINEMENT_RESERVE = 820
+MASTERY_REFINEMENT_RESERVE = 120
+KEYSTONE_REFINEMENT_RESERVE = 80
+
+
+def mastery_reserve_for(budget: SearchBudget) -> int:
+    """Keep a mastery share only when the configured budget can support it."""
+    return min(MASTERY_REFINEMENT_RESERVE, max(0, budget.limit - FINAL_REFINEMENT_RESERVE))
+
+
+def keystone_reserve_for(budget: SearchBudget) -> int:
+    """Keep a keystone share after reserving mastery and final-refinement work."""
+    remaining = budget.limit - FINAL_REFINEMENT_RESERVE - mastery_reserve_for(budget)
+    return min(KEYSTONE_REFINEMENT_RESERVE, max(0, remaining))
+
+
+def keystone_package_candidates(context: dict, spec: dict, calc: dict, data: GameData,
+                                items: list[RareItem], allocated: set[str], masteries: dict | None = None,
+                                jewels: dict | None = None) -> list[tuple[str, str, list[str], str, list[str], dict]]:
+    """Build reachable keystone packages, freeing a connected branch when needed."""
+    nodes = context["tree"]["nodes"]
+    stats = calc.get("stats", {})
+    adjacency = graph(nodes, lambda node: not node.get("ascendancyName") and not node.get("isMastery")
+                      and not node.get("isProxy") and not node.get("isJewelSocket")
+                      and ("classStartIndex" not in node or node["classStartIndex"] == 3))
+    reachable = paths_from(allocated, adjacency)
+    tags = data.gem(spec["skill"])["tags"]
+    remaining_points = (calc.get("passives", {}).get("maximum", 0) -
+                        calc.get("passives", {}).get("used", 0))
+    masteries = dict(masteries or {})
+    shield = any(item.slot == "Weapon 2" and item.definition.get("type") == "Shield" for item in items)
+    compatible = {
+        "Elemental Overload": (spec.get("archetype") != "minion" and
+                                spec.get("damageType") in {"fire", "cold", "lightning"},
+                                "elemental hit/ailment mechanism; exact PoB result checked"),
+        "Resolute Technique": (spec.get("archetype") == "attack",
+                               "attack mechanism; exact PoB hit and damage result checked"),
+        "Point Blank": (bool(tags.get("projectile") and tags.get("attack")),
+                        "projectile attack mechanism; exact PoB range configuration retained"),
+        "Mind Over Matter": (spec.get("focus") == "defense" and
+                             float(stats.get("ManaUnreserved", 0) or 0) >= 500,
+                             "defensive intent with a substantial unreserved mana pool"),
+        "Eldritch Battery": (spec.get("focus") == "defense" and
+                             float(stats.get("EnergyShield", 0) or 0) >= 500,
+                             "defensive intent with energy shield available to fund skills"),
+        "Necromantic Aegis": (spec.get("archetype") == "minion" and shield,
+                              "minion build with an equipped shield whose stats transfer to minions"),
+        "Zealot's Oath": (spec.get("focus") == "defense" and
+                          float(stats.get("EnergyShield", 0) or 0) > 0 and
+                          float(stats.get("LifeRegen", 0) or 0) > 0,
+                          "defensive energy-shield build with life regeneration to redirect"),
+    }
+    result = []
+    for key, path in reachable.items():
+        node = nodes.get(key, {})
+        if not node.get("isKeystone") or not path:
+            continue
+        if any(nodes.get(value, {}).get("isKeystone") for value in path if value != key):
+            continue
+        name = node.get("name", "")
+        rule = compatible.get(name)
+        if rule and rule[0]:
+            needed = max(0, len(path) - remaining_points)
+            if not needed:
+                result.append((name, key, path, rule[1], [], masteries))
+                continue
+            packages_added = 0
+            for removed in tree_reroute_removals(nodes, allocated, jewels, limit=48):
+                if any(nodes.get(value, {}).get("isKeystone") for value in removed):
+                    continue
+                remaining_tree = allocated - set(removed)
+                rerouted_path = paths_from(remaining_tree, adjacency).get(key)
+                if not rerouted_path or any(nodes.get(value, {}).get("isKeystone") for value in rerouted_path[:-1]):
+                    continue
+                remaining_groups = {nodes[value].get("group") for value in remaining_tree
+                                    if nodes[value].get("isNotable")}
+                lost_masteries = {mastery_node for mastery_node in masteries
+                                  if mastery_node not in remaining_tree or
+                                  nodes.get(mastery_node, {}).get("group") not in remaining_groups}
+                reroute_needed = max(0, len(rerouted_path) - remaining_points)
+                if len(removed) + len(lost_masteries) < reroute_needed:
+                    continue
+                updated_masteries = {mastery_node: effect for mastery_node, effect in masteries.items()
+                                     if mastery_node not in lost_masteries}
+                result.append((name, key, rerouted_path, rule[1],
+                               sorted(removed, key=int), updated_masteries))
+                packages_added += 1
+                if packages_added >= 2:
+                    break
+    return sorted(result, key=lambda entry: (len(entry[2]), len(entry[4]), entry[0], int(entry[1])))
 
 
 def named_skill(prompt: str, data: GameData) -> str | None:
@@ -500,7 +589,8 @@ def search_ordinary_jewels(context: dict, spec: dict, allocated: set[str], jewel
         best = None
         for _, _, key, path in sockets:
             for template in templates[:4]:
-                if not budget.claim(reserve=FINAL_REFINEMENT_RESERVE):
+                if not budget.claim(reserve=FINAL_REFINEMENT_RESERVE + mastery_reserve_for(budget) +
+                                    keystone_reserve_for(budget)):
                     break
                 candidate_nodes = allocated | set(path)
                 candidate_jewels = {**jewels, key: template}
@@ -520,7 +610,8 @@ def search_ordinary_jewels(context: dict, spec: dict, allocated: set[str], jewel
                                  (delta == best[0] and (int(key), template.base) <
                                   (int(best[1]), best[2].base))):
                     best = (delta, key, template, candidate, candidate_nodes)
-            if budget.limit - budget.used <= FINAL_REFINEMENT_RESERVE:
+            if budget.limit - budget.used <= (FINAL_REFINEMENT_RESERVE + mastery_reserve_for(budget) +
+                                               keystone_reserve_for(budget)):
                 break
         if best is None:
             break
@@ -1098,6 +1189,9 @@ def unique_options(context, spec, market, items, data, unique_defs=None):
         name, base_name = definition.get("name"), definition.get("base")
         if not name or not base_name:
             continue
+        if name == "The Queen's Hunger" and name not in spec.get("requestedUniques", ()):
+            # Its triggered offerings are disabled unless the user explicitly asks for it.
+            continue
         base = data.bases.get(base_name, {})
         for item in items:
             unique_type = definition.get("type", base.get("type"))
@@ -1128,14 +1222,20 @@ def unique_options(context, spec, market, items, data, unique_defs=None):
                 sockets = 0
             if item.slot == "Body Armour" and sockets < spec.get("mainLinks", 6):
                 continue
+            raw = definition.get("raw") or current_unique(definition.get("source", ""))
+            if sockets and not re.search(r"(?m)^Sockets:", raw):
+                raw += "\nSockets: " + "-".join("B" for _ in range(sockets))
+            if item.slot in spec.get("utility", {}).values():
+                required_sockets = sum(1 for destination in spec.get("utility", {}).values()
+                                       if destination == item.slot)
+                actual_sockets = item_socket_count(raw)
+                if actual_sockets is not None and actual_sockets < required_sockets:
+                    continue
             price = unique_market_price(definition, market, sockets if sockets > 0 else None)
             # A stated budget needs a variant/link-specific quote. Without a
             # budget, missing quotes leave the candidate visible as unknown.
             if cap is not None and (price is None or price > cap):
                 continue
-            raw = definition.get("raw") or current_unique(definition.get("source", ""))
-            if sockets and not re.search(r"(?m)^Sockets:", raw):
-                raw += "\nSockets: " + "-".join("B" for _ in range(sockets))
             options.append((name, item.slot, raw, price))
     return options
 
@@ -1169,6 +1269,11 @@ def unique_is_two_handed(text: str, data: GameData) -> bool:
         return False
     tags = data.bases.get(base_name, {}).get("tags", {})
     return bool(tags.get("two_hand_weapon") or tags.get("twohanded"))
+
+
+def item_socket_count(text: str) -> int | None:
+    match = re.search(r"(?m)^Sockets:\s*([RGBW-]+)\s*$", text or "")
+    return len(re.findall(r"[RGBW]", match.group(1))) if match else None
 
 
 def unique_pair_has_weapon_conflict(first: tuple, second: tuple, data: GameData) -> bool:
@@ -1229,8 +1334,14 @@ def validate_design(context, spec, allocated, masteries, items, uniques, data, j
     for name, slot in spec["utility"].items():
         if name in data.gems:
             counts[slot] = counts.get(slot, 0) + 1
-    socket_capacity = all(count <= next((min(4, item.definition.get("socketLimit", 0)) for item in items
-                                         if item.slot == slot), 0) for slot, count in counts.items())
+    def available_utility_sockets(slot):
+        if slot in uniques:
+            actual = item_socket_count(uniques[slot])
+            if actual is not None:
+                return actual
+        item = next((item for item in items if item.slot == slot), None)
+        return min(4, item.definition.get("socketLimit", 0)) if item else 0
+    socket_capacity = all(count <= available_utility_sockets(slot) for slot, count in counts.items())
     legal_affixes = True
     for item in items:
         if item.slot in uniques:
@@ -1270,6 +1381,113 @@ def validate_design(context, spec, allocated, masteries, items, uniques, data, j
              "reason": "Generated rares use eligible installed tiers, distinct groups and at most three prefixes/suffixes"},
             {"name": "Ordinary jewel sockets and affixes", "passed": legal_jewels,
              "reason": "Each rare jewel must use one allocated ordinary socket and eligible PoB jewel affixes"}]
+
+
+def build_quality_report(xml: str, spec: dict, details: dict, calculation: dict,
+                         data: GameData, price: dict, progression: list[dict]) -> dict:
+    """Report gameplay completeness, encounter gaps and price coverage separately from legality."""
+    root = ET.fromstring(xml)
+    skills_root = root.find("Skills")
+    active_skill_id = skills_root.get("activeSkillSet", "1") if skills_root is not None else "1"
+    skills = next((entry for entry in root.findall("./Skills/SkillSet")
+                   if entry.get("id") == active_skill_id), None)
+    groups = skills.findall("Skill") if skills is not None else []
+    utility_names = set(spec.get("utility", {}))
+    role_predicates = {
+        "movement": lambda tags: any(tags.get(tag) for tag in ("movement", "travel", "blink")),
+        "guard": lambda tags: bool(tags.get("guard")),
+        "aura": lambda tags: bool(tags.get("aura")),
+        "curse": lambda tags: bool(tags.get("curse")),
+    }
+    required_roles = {"movement", "guard", "aura"}
+    if spec.get("expectedCurse"):
+        required_roles.add("curse")
+    present_roles = {role: sorted(name for name in utility_names if name in data.gems and
+                                  predicate(data.gem(name)["tags"]))
+                     for role, predicate in role_predicates.items()}
+    missing_roles = sorted(role for role in required_roles if not present_roles[role])
+    main_group = next((group for group in groups if group.get("includeInFullDPS") == "true"), None)
+    main_gems = [gem for gem in main_group.findall("Gem") if gem.get("gemId")] if main_group is not None else []
+    active_set_id = root.find("./Items").get("activeItemSet", "1") if root.find("./Items") is not None else "1"
+    item_set = next((entry for entry in root.findall("./Items/ItemSet") if entry.get("id") == active_set_id), None)
+    items_by_id = {item.get("id"): item for item in root.findall("./Items/Item")}
+    body_slot = next((slot for slot in item_set.findall("Slot") if slot.get("name") == "Body Armour"), None) if item_set is not None else None
+    body = items_by_id.get(body_slot.get("itemId")) if body_slot is not None else None
+    socket_line = next((line for line in (body.text or "").splitlines() if line.startswith("Sockets:")), "") if body is not None else ""
+    main_socket_count = len(re.findall(r"[RGBW]-?", socket_line.split(":", 1)[-1]))
+    spare_main_sockets = max(0, main_socket_count - len(main_gems))
+    granted_groups = [group for group in groups if group.get("source", "").startswith("Item:")]
+    active_tree_id = root.find("./Tree").get("activeSpec", "1") if root.find("./Tree") is not None else "1"
+    active_tree_spec = next((entry for entry in root.findall("./Tree/Spec")
+                             if entry.get("id") == active_tree_id), None)
+    socket_ids = {socket.get("itemId") for socket in active_tree_spec.findall("./Sockets/Socket")
+                  if socket.get("itemId") not in {None, "0"}} if active_tree_spec is not None else set()
+    jewel_count = sum(1 for item in root.findall("./Items/Item") if item.get("id") in socket_ids and
+                      data.bases.get(_item_parts(item.text or "")[2], {}).get("type") == "Jewel")
+    build = root.find("Build")
+    pantheon_selected = bool(build is not None and
+                             build.get("pantheonMajorGod", "None") not in {"None", ""} and
+                             build.get("pantheonMinorGod", "None") not in {"None", ""})
+    stats = calculation.get("stats", {})
+    passive_data = calculation.get("passives", {})
+    flask_ok = flasks_complete(xml, data, int(spec["level"]))
+    selected_masteries = (len(re.findall(r"\{\d+,\d+\}", active_tree_spec.get("masteryEffects", "")))
+                          if active_tree_spec is not None else 0)
+    completeness_gaps = [f"missing {role} skill role" for role in missing_roles]
+    if not flask_ok:
+        completeness_gaps.append("fewer than five level-legal equipped flasks")
+    if spare_main_sockets:
+        completeness_gaps.append(f"{spare_main_sockets} unused main-link socket(s)")
+    completeness = {
+        "status": "gaps" if completeness_gaps else "complete",
+        "gaps": completeness_gaps,
+        "roles": {"required": sorted(required_roles), "present": present_roles},
+        "mainLink": {"gemCount": len(main_gems), "socketCount": main_socket_count,
+                     "unusedSockets": spare_main_sockets},
+        "flasksComplete": flask_ok,
+        "allocatedMasteries": selected_masteries,
+        "equippedJewels": jewel_count,
+        "itemGrantedSkillGroups": len(granted_groups),
+        "socketedGemCount": sum(1 for group in groups for gem in group.findall("Gem") if gem.get("gemId")),
+        "unspentPassivePoints": max(0, int(passive_data.get("maximum", 0)) - int(passive_data.get("used", 0))),
+    }
+    readiness_gaps = list(completeness_gaps)
+    chaos = float(stats.get("ChaosResist", 0) or 0)
+    life_pool = float(stats.get("Life", 0) or 0) + float(stats.get("EnergyShield", 0) or 0)
+    ehp = float(stats.get("TotalEHP", 0) or 0)
+    armour = float(stats.get("Armour", 0) or 0)
+    if chaos < 0:
+        readiness_gaps.append(f"chaos resistance is {chaos:.0f}% (0% target)")
+    if life_pool < 6000:
+        readiness_gaps.append(f"life plus energy shield is {life_pool:.0f} (6,000 target)")
+    if ehp < 15000:
+        readiness_gaps.append(f"effective hit pool is {ehp:.0f} (15,000 target)")
+    if "Determination" in utility_names and armour < 10000:
+        readiness_gaps.append(f"armour is {armour:.0f} with Determination selected (10,000 review target)")
+    if not pantheon_selected:
+        readiness_gaps.append("major and minor Pantheons are unselected")
+    mapping = next((entry for entry in progression if entry.get("act") == 11), {})
+    price_coverage = {
+        "scope": "Endgame equipped items; rare gear remains a modifier-aware estimate",
+        "complete": bool(price.get("complete")),
+        "pricedSubtotalChaos": price.get("pricedSubtotalChaos"),
+        "unknownSlots": price.get("unknown", []),
+        "budgetStatus": price.get("budgetStatus"),
+        "mappingUniqueSubtotalChaos": mapping.get("uniquePackageCostChaos"),
+        "mappingPackagePriceStatus": ("no Mapping unique package selected"
+                                      if not mapping.get("uniquePackage") else
+                                      "unknown or unpriced; not a complete gear cost"
+                                      if mapping.get("uniquePackageCostChaos") is None else
+                                      "priced unique subtotal; rare slots remain unpriced"),
+    }
+    return {
+        "completeness": completeness,
+        "encounterReadiness": {"status": "review_gaps" if readiness_gaps else "targets_met",
+                               "assessedEnemyLevel": spec.get("enemyLevel", 83),
+                               "gaps": readiness_gaps,
+                               "note": "These targets describe the configured PoB encounter; they do not predict a guaranteed boss kill."},
+        "priceCoverage": price_coverage,
+    }
 
 
 def unique_pair_shortlist(unique_candidates, uniques, archetype, damage_type, limit=6):
@@ -1491,8 +1709,9 @@ def complete_design_search(context, spec, data, worker, stage, trace, budget, st
     # those repairs cannot consume the link and passive-tree searches. The
     # tree gets half of the remaining budget because it is the final quality
     # pass and often needs multiple scored batches to use available points.
-    resource_utility_reserve = len(mana_utility_levels(
-        spec, data, state["calc"], state["items"], require_deficit=False))
+    resource_utility_reserve = (len(mana_utility_levels(
+        spec, data, state["calc"], state["items"], require_deficit=False)) + mastery_reserve_for(budget) +
+        keystone_reserve_for(budget))
     refinement_budget = max(0, budget.limit - budget.used - resource_utility_reserve)
     stage_reserves = {
         "gear": resource_utility_reserve + refinement_budget * 85 // 100,
@@ -1854,6 +2073,9 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
     supports, masteries, uniques = [], {}, {}
     jewels: dict[str, RareItem] = {}
     requested_uniques = set(spec.get("requestedUniques", []))
+    if "The Queen's Hunger" in requested_uniques and "Desecrate" in data.gems:
+        spec.setdefault("utility", {})["Desecrate"] = "Boots"
+        spec["requestedUtilities"] = list(dict.fromkeys([*spec.get("requestedUtilities", []), "Desecrate"]))
     if requested_uniques and spec["noUniques"]:
         raise ValueError("The request asks for a unique item and rares-only equipment at the same time")
 
@@ -1950,7 +2172,8 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
     # Preserve room for equipment and tree refinement after this linked tree pass.
     allocated, calc = search_tree(context, spec, allocated, lambda nodes: render(nodes=nodes), worker, stage,
                                   trace=trace, budget=budget, baseline_calc=calc,
-                                  budget_reserve=FINAL_REFINEMENT_RESERVE)
+                                  budget_reserve=(FINAL_REFINEMENT_RESERVE + mastery_reserve_for(budget) +
+                                                  keystone_reserve_for(budget)))
     if sync_permanent_minion_count(spec, calc):
         if not budget.claim():
             budget.exhausted = True
@@ -1973,8 +2196,8 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
     candidates = mastery_choices(context, allocated)
     candidates.sort(key=lambda entry: -heuristic(context["tree"]["nodes"][entry[0]], spec))
     for node, effects in candidates:
-        if budget.limit - budget.used <= FINAL_REFINEMENT_RESERVE:
-            # Keep enough shared budget for the complete gear/link/tree pass.
+        if budget.limit - budget.used <= FINAL_REFINEMENT_RESERVE + keystone_reserve_for(budget):
+            # Keep room for complete-build refinement and mechanics-aware keystones.
             break
         if calc["passives"]["used"] >= calc["passives"]["maximum"]:
             break
@@ -1983,7 +2206,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
         # mastery legality and point consumption, including duplicate effects.
         ranked = sorted(effects, key=lambda effect: -heuristic({"stats": effect.get("stats", [])}, spec))[:8]
         for effect in ranked:
-            if not budget.claim():
+            if not budget.claim(reserve=FINAL_REFINEMENT_RESERVE + keystone_reserve_for(budget)):
                 break
             identifier = effect.get("effect")
             if identifier in used_effects:
@@ -2012,6 +2235,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
     # Keep optional equipment search bounded and representative across slots;
     # explicit requests always remain in the shortlist.
     optional_candidates = []
+    mapping_unique_candidates = list(required_candidates)
     for slot, entries in sorted(optional_by_slot.items()):
         ranked = sorted(entries, key=lambda option: (
             -sum(term in option[2].lower() for term in
@@ -2020,6 +2244,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                   ("spell", "cast speed", "critical strike", spec["damageType"], "damage", "maximum life", "resistance"))),
             option[0]))
         optional_candidates.extend(ranked[:2])
+        mapping_unique_candidates.extend(ranked[:4])
     supported_interactions = []
     if spec["archetype"] == "minion" and spec["skill"] == "Raise Zombie":
         for names in (("The Baron", "Shaper's Touch"),):
@@ -2031,6 +2256,8 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                 if option is not None:
                     if not any(entry[0] == name for entry in optional_candidates):
                         optional_candidates.append(option)
+                    if not any(entry[0] == name for entry in mapping_unique_candidates):
+                        mapping_unique_candidates.append(option)
                     interaction.append(name)
             if len(interaction) == len(names):
                 supported_interactions.append(list(names))
@@ -2046,7 +2273,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
         trace.append({"kind": "unique_shortlist", "requested": [entry[0] for entry in required_candidates],
                       "optionalTested": len(optional_candidates),
                       "supportedInteractions": supported_interactions,
-                      "reason": "all requested compatible slot candidates plus up to two optional candidates per equipment slot"})
+                      "reason": "all requested compatible slot candidates plus up to two optional endgame candidates per equipment slot"})
     for name, slot, text, candidate_price in unique_candidates:
         if name in {_item_parts(value)[1] for value in uniques.values()}:
             continue
@@ -2307,6 +2534,70 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                                                if slot.startswith("Flask ")})
     jewels = best_design["jewels"]
     calc = best_design["calc"]
+    # Tree reroutes can remove an old mastery group and connect a new one.
+    # Score those newly reachable effects against the final complete package,
+    # using the evaluation share protected from optional refinements above.
+    used_effects = {effect for effect in masteries.values()}
+    post_refinement_utility_reserve = len(mana_utility_levels(
+        spec, data, calc, items, require_deficit=False))
+    newly_unlocked = mastery_choices(context, allocated)
+    newly_unlocked.sort(key=lambda entry: -heuristic(context["tree"]["nodes"][entry[0]], spec))
+    for node, effects in newly_unlocked:
+        if node in masteries or calc["passives"]["used"] >= calc["passives"]["maximum"]:
+            continue
+        best = None
+        ranked = sorted(effects, key=lambda effect: -heuristic({"stats": effect.get("stats", [])}, spec))[:8]
+        for effect in ranked:
+            if not budget.claim(reserve=keystone_reserve_for(budget) + post_refinement_utility_reserve):
+                break
+            identifier = effect.get("effect")
+            if identifier in used_effects:
+                continue
+            candidate = worker.request("calculate", xml=render(
+                nodes=allocated | {node}, mastery={**masteries, node: identifier}))
+            if (candidate["passives"]["used"] <= candidate["passives"]["maximum"] and
+                    candidate_score(candidate["stats"], spec) > candidate_score(calc["stats"], spec) + 0.001):
+                if best is None or candidate_score(candidate["stats"], spec) > candidate_score(best[1]["stats"], spec):
+                    best = (identifier, candidate)
+        if best:
+            masteries[node], calc = best
+            allocated.add(node)
+            used_effects.add(best[0])
+            if trace is not None:
+                trace.append({"kind": "mastery_selection", "node": node, "effect": best[0],
+                              "reason": "best compatible PoB score after complete-build tree refinement"})
+    stage("Testing mechanics-compatible keystone packages in PoB")
+    keystone_candidates = keystone_package_candidates(context, spec, calc, data, items, allocated,
+                                                       masteries, jewels)
+    current_score = candidate_score(calc["stats"], spec)
+    best_keystone = None
+    for name, node, path, rationale, removed, candidate_masteries in keystone_candidates:
+        if not budget.claim(reserve=post_refinement_utility_reserve):
+            break
+        candidate_nodes = (allocated - set(removed)) | set(path)
+        candidate = worker.request("calculate", xml=render(nodes=candidate_nodes,
+                                                              mastery=candidate_masteries))
+        candidate_value = candidate_score(candidate["stats"], spec)
+        legal = (candidate["passives"]["used"] <= candidate["passives"]["maximum"] and
+                 all(check["passed"] for check in validate_calculation(candidate)) and
+                 all(check["passed"] for check in validate_design(context, spec, candidate_nodes,
+                             candidate_masteries, items, uniques, data, jewels)))
+        selected = legal and candidate_value > current_score + 0.001
+        if trace is not None:
+            trace.append({"kind": "keystone_package", "name": name, "node": node,
+                          "path": path, "eligibleMechanic": rationale,
+                          "removedNodes": removed,
+                          "skill": spec["skill"], "enemyLevel": spec.get("enemyLevel", 83),
+                          "scoreDelta": round(candidate_value - current_score, 6),
+                          "selected": selected, "passedLegality": legal,
+                          "comparison": "Same PoB skill, enemy level and configuration; only the connected keystone path changed."})
+        if selected and (best_keystone is None or candidate_value > best_keystone[0]):
+            best_keystone = (candidate_value, name, node, candidate_nodes, candidate_masteries, candidate)
+    if best_keystone:
+        _, name, node, allocated, masteries, calc = best_keystone
+        if trace is not None:
+            trace.append({"kind": "keystone_selection", "name": name, "node": node,
+                          "reason": "mechanics-compatible package improved the same-encounter PoB score and passed legality"})
     if mana_utility_levels(spec, data, calc, items):
         stage("Testing Clarity levels to sustain repeated mana use")
         calc = search_mana_utility(spec, data, items, render, worker, calc, budget, trace)
@@ -2325,6 +2616,13 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                           "xml": xml})
         raise
     xml = calc.pop("xml")
+    xml, disabled_item_skills = disable_conditional_item_skill_groups(xml)
+    if disabled_item_skills:
+        spec["disabledConditionalItemSkills"] = disabled_item_skills
+        calc = export_with_pob(xml, app_root, data_root)
+        xml = calc.pop("xml")
+        if disable_conditional_item_skill_groups(xml)[1]:
+            raise ValueError("PoB re-enabled unsupported conditional item-granted skills during exact export")
     checks, details = validate_structure(xml, context, spec["ascendancy"], spec["skill"])
     checks.extend(validate_calculation(calc))
     checks.extend(validate_design(context, spec, allocated, masteries, items, uniques, data, jewels))
@@ -2345,11 +2643,19 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
     close_worker()
     worker = get_worker(app_root, data_root)
     worker.calls = prior_calls
-    xml, progression = add_progression(xml, spec, context, data, worker, stage)
+    xml, progression = add_progression(xml, spec, context, data, worker, stage,
+                                       unique_candidates=mapping_unique_candidates)
     stage("Exporting and verifying the complete campaign-to-endgame PoB")
     expected_endgame = progression[-1].pop("_calculation")
     final = export_with_pob(xml, app_root, data_root)
     xml = final.pop("xml")
+    final_disabled, disabled_again = disable_conditional_item_skill_groups(xml)
+    if disabled_again:
+        xml = final_disabled
+        spec["disabledConditionalItemSkills"] = disabled_again
+        final = export_with_pob(xml, app_root, data_root)
+        xml = final.pop("xml")
+    active_conditional_skills = disable_conditional_item_skill_groups(xml)[1]
     final_changes = {key: {"progression": expected_endgame.get(key), "export": final.get(key)}
                      for key in set(expected_endgame) | set(final)
                      if expected_endgame.get(key) != final.get(key)}
@@ -2373,6 +2679,10 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
     checks.extend(final_calculation_checks)
     checks.append({"name": "Campaign to endgame progression", "passed": True,
                    "reason": f"{len(progression)} matched loadouts; every stage calculated and checked for levels, points, sockets, attributes, resistances and mana"})
+    checks.append({"name": "Conditional item-granted skill uptime", "passed": not active_conditional_skills,
+                   "reason": ("No unmodeled triggered offering is enabled"
+                              if not active_conditional_skills else
+                              "An item-granted offering is enabled without modeled trigger and corpse uptime")})
     price = quote(details["gear"], market, spec["budgetChaos"] if spec["budgetChaos"] is not None else 10_000_000)
     if spec["budgetChaos"] is None:
         price["budgetChaos"] = None
@@ -2417,6 +2727,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
                                "purpose": "Reserve part of calculated recovery for movement, curses and other utility casts",
                                "sustain": sustained_resource_use(calc.get("stats", {}), spec)},
               "mappingPlan": spec.get("mappingSupportPlan", mapping_support_plan(trace or [], supports)),
+              "conditionalItemSkillsDisabled": spec.get("disabledConditionalItemSkills", []),
               "selectionReasons": {"ascendancy": ("Selected from the requested skill tags and explicit prompt choices" +
                                                      (": " + ", ".join(selected_ascendancy) if selected_ascendancy else ".")),
                                    "passives": "PoB-calculated candidate gains; neutral leaves pruned; " + passive_reason,
@@ -2438,6 +2749,7 @@ def build_design(spec, context, market, app_root, data_root, stage, data=None, t
               "searchLimitWarning": (f"Search stopped at {budget.used}/{budget.limit} design evaluations after preserving mandatory search budget; best feasible candidate retained"
                                      if budget.exhausted else None)}
     recipe["progression"] = progression
+    recipe["qualityDiagnostics"] = build_quality_report(xml, spec, details, calc, data, price, progression)
     return xml, recipe, checks, details, calc, price
 
 
@@ -2454,6 +2766,10 @@ def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
     stage(f"Parsing build intent with {model}")
     spec = parse_intent(prompt, model, data, market)
     spec["requestedUniques"] = mentioned_uniques(prompt, context, data.unique_items)
+    if "The Queen's Hunger" in spec["requestedUniques"] and "Desecrate" in data.gems:
+        # Give its corpse-consuming triggered offerings an explicit boss-corpse source.
+        spec["utility"]["Desecrate"] = "Boots"
+        spec["requestedUtilities"] = list(dict.fromkeys([*spec.get("requestedUtilities", []), "Desecrate"]))
     xml, recipe, checks, details, calculation, price = build_design(
         spec, context, market, app_root, data_root, stage, data)
     mechanics = recipe.get("mechanics") or mechanic_profile(spec)
@@ -2467,6 +2783,9 @@ def generate(request: dict, app_root: Path, data_root: Path, stage) -> dict:
             "ascendancyPoints": details["ascendancyPoints"], "gear": details["gear"],
             "validation": checks, "mechanicChecks": mechanic_checks,
             "qualityStatus": quality_status, "qualityWarnings": quality_warnings,
+            "completeness": recipe.get("qualityDiagnostics", {}).get("completeness"),
+            "encounterReadiness": recipe.get("qualityDiagnostics", {}).get("encounterReadiness"),
+            "priceCoverage": recipe.get("qualityDiagnostics", {}).get("priceCoverage"),
             "stats": calculation["stats"], "pobVersion": calculation.get("version"),
             "quote": price, "recipe": recipe, "modelUsed": model, "prompt": prompt,
             "modelIntent": f"{spec['focus'].capitalize()} focus with {spec['skill']}; links and passive clusters scored in PoB.",
