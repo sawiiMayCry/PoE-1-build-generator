@@ -2,13 +2,78 @@
 from __future__ import annotations
 
 import copy
+from itertools import combinations
 import re
 import xml.etree.ElementTree as ET
 
-from build_assembly import assemble
+from build_assembly import assemble, disable_conditional_item_skill_groups
 from build_generator import _item_parts, _main_group, offense_value
 from generation_data import base_required_level, rare_templates, solve_suffixes
 from passive_search import candidate_minion_count, graph, heuristic, paths_from
+
+
+def mapping_unique_packages(options: list[tuple], spec: dict, data, level: int,
+                            limit: int = 24) -> list[list[tuple]]:
+    """Return level-legal, budget-valid single and two-item Mapping targets."""
+    eligible = []
+    for option in options:
+        name, slot, text, price = option[:4]
+        _, _, base = _item_parts(text)
+        definition = data.bases.get(base, {})
+        if not definition or base_required_level(definition) > level:
+            continue
+        eligible.append(option[:4])
+    terms = ("minion", "reservation", "spell", "life", "resistance", spec.get("damageType", ""))
+    def rank(option):
+        low = option[2].casefold()
+        return sum(term.casefold() in low for term in terms if term), option[0]
+    eligible.sort(key=lambda option: (-rank(option)[0], option[0], option[1]))
+    required = set(spec.get("requestedUniques", ()))
+    packages = []
+    seen = set()
+    def keep(package):
+        names = {entry[0] for entry in package}
+        if required and not required <= names:
+            return
+        if spec.get("budgetChaos") is not None and (
+                any(entry[3] is None for entry in package) or
+                sum(entry[3] for entry in package) > spec["budgetChaos"]):
+            return
+        if len({entry[1] for entry in package}) != len(package):
+            return
+        key = tuple(sorted((entry[0], entry[1]) for entry in package))
+        if key not in seen:
+            seen.add(key)
+            packages.append(list(package))
+    single_limit = max(1, limit // 2)
+    single_options = [option for option in eligible if option[0] in required]
+    single_options.extend(option for option in eligible if option[0] not in required)
+    for option in single_options[:single_limit]:
+        keep([option])
+    pairs = []
+    for first, second in combinations(eligible, 2):
+        if first[1] == second[1]:
+            continue
+        names = {first[0], second[0]}
+        if required and not required <= names:
+            continue
+        try:
+            first_base = _item_parts(first[2])[2]
+            second_base = _item_parts(second[2])[2]
+        except ValueError:
+            continue
+        if ((first[1] == "Weapon 1" and data.bases.get(first_base, {}).get("tags", {}).get("two_hand_weapon") and
+             second[1] == "Weapon 2") or
+            (second[1] == "Weapon 1" and data.bases.get(second_base, {}).get("tags", {}).get("two_hand_weapon") and
+             first[1] == "Weapon 2")):
+            continue
+        relevance = rank(first)[0] + rank(second)[0]
+        pairs.append((-relevance, tuple(sorted(names)), (first, second)))
+    for _, _, package in sorted(pairs):
+        keep(package)
+        if len(packages) >= limit:
+            break
+    return packages[:limit]
 
 
 # Checkpoints are after each act's passive quests, with kill-all bandits.
@@ -318,6 +383,8 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
              "The act checkpoints show targets after those penalties, not pre-Kitava values.",
              "RESOURCE PLAN: Main-skill sustain uses at most 85% of calculated recovery, leaving a reserve for movement, curses and other utility casts.",
              "CURSE: The selected curse matches the build's damage mechanism. Cast it when needed; PoB damage does not assume continuous curse uptime.", ""]
+    for entry in spec.get("disabledConditionalItemSkills", []):
+        lines.append(f"CONDITIONAL ITEM SKILL: {entry['skill']} from {entry['item']} is disabled in calculations because trigger timing, corpse availability and uptime are not modeled.")
     previous = None
     for phase in stages:
         lines += [phase["title"].upper(), f"Main link: {' -> '.join(phase['gems'])}",
@@ -330,9 +397,14 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
         lines.extend(phase["instructions"])
         lines.append("Gems: " + "; ".join(f"{name} level {level}" for name, level in phase["gemLevels"].items()))
         lines.append("Equipment: " + "; ".join(f"{item['slot']}: {item['base']}" for item in phase["gear"]))
+        if phase.get("act") == 11:
+            if phase.get("uniquePackageCostChaos") is None:
+                lines.append("Mapping package price is unknown or no priced unique package was selected; rare equipment remains unpriced.")
+            elif phase.get("uniquePackageCostChaos", 0):
+                lines.append(f"Mapping unique package has a {phase['uniquePackageCostChaos']:g} chaos priced subtotal; this is not a complete gear cost because rare slots remain unpriced.")
         lines.append("")
-    lines += ["MAPPING AND ENDGAME", "Mapping uses meaningful measured supports up to a five-link and campaign-accessible rares; acquire the six-link and final equipment before selecting Endgame.",
-              "Endgame is the requested level and generated equipment target. The validation checks establish minimum viability, not boss-kill capability.",
+    lines += ["MAPPING AND ENDGAME", "Mapping has an independent level-legal equipment target. The generator compares bounded unique packages against all-rare gear in PoB and keeps rares when no tested package scores better within budget.",
+              "Endgame is a separate requested-level design and equipment target. The validation checks establish minimum viability, not boss-kill capability.",
               "Rare items and gems remain unpriced. Improve sustained mana recovery, chaos resistance and ailment protection before harder maps."]
     mapping = spec.get("mappingSupportPlan", {})
     if mapping.get("integratedCoverageSupports"):
@@ -343,7 +415,8 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, stage):
+def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, stage,
+                    unique_candidates: list[tuple] | None = None):
     root = ET.fromstring(endgame_xml)
     final_spec = root.find("./Tree/Spec")
     official = context["tree"]["nodes"]
@@ -362,6 +435,7 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
     final_supports = [gem.get("nameSpec") for gem in _main_group(root)[1].findall("Gem")][1:]
     phases, documents, summaries = milestones(spec["level"]), [], []
     previous_skill, previous_ascendancy = None, 0
+    unique_candidates = unique_candidates or []
     for phase in phases:
         stage("Generating and validating " + phase["title"])
         instructions = []
@@ -374,6 +448,8 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             gem_levels = {gem.get("nameSpec"): int(gem.get("level")) for gem in document.findall("./Skills/SkillSet/Skill/Gem")
                           if gem.get("gemId")}
             supports = final_supports
+            stage_uniques = {}
+            mapping_package_price = 0
         else:
             main_skill = stage_skill(spec, data, phase)
             phase_spec = {**spec, "skill": main_skill, "level": phase["level"], "minionCount": 1,
@@ -396,8 +472,10 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             # requested final attack. Spell/minion starters can use the same type.
             items = rare_templates(data, spec["archetype"], spec["weaponType"], character_level=phase["level"])
             supports = []
+            stage_uniques = {}
+            mapping_package_price = 0
             def render():
-                return assemble(phase_spec, context, data, selected, supports, items, effects)
+                return assemble(phase_spec, context, data, selected, supports, items, effects, stage_uniques)
             xml = render()
             compatible = set(worker.request("supports", xml=xml)["supports"])
             early = ["Minion Damage", "Added Lightning Damage", "Added Cold Damage", "Arcane Surge", "Combustion", "Lesser Multiple Projectiles"]
@@ -428,6 +506,46 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
                         gem_levels.pop(supports.pop(), None)
                         continue
                 break
+            if phase["act"] == 11 and unique_candidates:
+                best_score = offense_value(calc["stats"])
+                mapping_target = None
+                for package in mapping_unique_packages(unique_candidates, spec, data, phase["level"]):
+                    package_items = copy.deepcopy(items)
+                    package_uniques = {entry[1]: entry[2] for entry in package}
+                    for item in package_items:
+                        if item.slot in package_uniques:
+                            item.mods.clear()
+                    def package_xml():
+                        return assemble(phase_spec, context, data, selected, supports, package_items,
+                                        effects, package_uniques)
+                    candidate_xml = ET.fromstring(package_xml())
+                    add_flasks(candidate_xml, data, phase["level"])
+                    trial_xml = ET.tostring(candidate_xml, encoding="unicode")
+                    trial_calc = worker.request("calculate", xml=trial_xml)
+                    for _ in range(3):
+                        if not solve_suffixes(package_items, data, trial_calc["stats"],
+                                              resistance_target=phase["resistanceTarget"]):
+                            break
+                        candidate_xml = ET.fromstring(package_xml())
+                        add_flasks(candidate_xml, data, phase["level"])
+                        trial_xml = ET.tostring(candidate_xml, encoding="unicode")
+                        trial_calc = worker.request("calculate", xml=trial_xml)
+                    trial_checks = stage_checks(trial_xml, phase, trial_calc, data, context)
+                    trial_score = offense_value(trial_calc["stats"])
+                    if all(check["passed"] for check in trial_checks) and trial_score > best_score + 0.001:
+                        best_score = trial_score
+                        package_price = (None if any(entry[3] is None for entry in package) else
+                                         sum(entry[3] for entry in package))
+                        mapping_target = (package_items, package_uniques, trial_calc, package_price)
+                if mapping_target:
+                    items, stage_uniques, calc, mapping_package_price = mapping_target
+                    names = [_item_parts(text)[1] for text in stage_uniques.values()]
+                    instructions.append("Mapping equipment target: " + ", ".join(names) +
+                                        ("; package selected from level-legal PoB comparisons within the stated budget."
+                                         if spec.get("budgetChaos") is not None else
+                                         "; package selected from level-legal PoB comparisons; no budget cap was stated."))
+                elif spec.get("budgetChaos") is not None:
+                    instructions.append("Mapping kept its all-rare equipment target; no tested level-legal unique package improved the PoB result within budget.")
             document = ET.fromstring(render())
             add_flasks(document, data, phase["level"])
             xml = ET.tostring(document, encoding="unicode")
@@ -460,6 +578,12 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             instructions.append(f"This checkpoint includes Kitava's {phase['resistancePenalty']}% total resistance penalty; repair gear to reach 75% fire, cold and lightning resistance.")
         previous_skill, previous_ascendancy = main_skill, phase["ascendancyPoints"]
         export = worker.request("export", xml=xml)
+        saved_xml, disabled_grants = disable_conditional_item_skill_groups(export["xml"])
+        if disabled_grants:
+            spec["disabledConditionalItemSkills"] = disabled_grants
+            export = worker.request("export", xml=saved_xml)
+            if disable_conditional_item_skill_groups(export["xml"])[1]:
+                raise ValueError(phase["title"] + " re-enabled unsupported conditional item-granted skills")
         documents.append(export["xml"])
         # PoB's first save materializes default combat placeholders. Score and
         # summarize the saved stage that will actually be merged/shared.
@@ -470,14 +594,17 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             raise ValueError(phase["title"] + " failed saved-export validation: " + ", ".join(failures))
         gear = []
         for item in document.findall("./Items/Item"):
-            _, _, base = _item_parts(item.text)
-            item_slots = [slot.get("name") for slot in document.findall("./Items/ItemSet/Slot") if slot.get("itemId") == item.get("id")]
-            for slot in item_slots:
-                gear.append({"slot": slot, "base": base})
+                rarity, name, base = _item_parts(item.text)
+                item_slots = [slot.get("name") for slot in document.findall("./Items/ItemSet/Slot") if slot.get("itemId") == item.get("id")]
+                for slot in item_slots:
+                    gear.append({"slot": slot, "name": name, "rarity": rarity, "base": base})
         actual_levels = {gem.get("nameSpec"): int(gem.get("level")) for gem in document.findall("./Skills/SkillSet/Skill/Gem")
                          if gem.get("gemId")}
         summaries.append({**phase, "mainSkill": main_skill, "gems": [main_skill, *supports],
                           "gemLevels": actual_levels, "gear": gear, "stats": calc["stats"], "validation": checks,
+                          "uniquePackageCostChaos": mapping_package_price if phase["act"] == 11 else None,
+                          "uniquePackage": ([_item_parts(text)[1] for text in stage_uniques.values()]
+                                            if phase["act"] == 11 else []),
                           "passives": calc["passives"]["used"], "passiveBudget": phase["level"] - 1 + phase["questPoints"] +
                           max(0, calc["stats"].get("ExtraPoints", 1) - 1),
                           "_calculation": calc,

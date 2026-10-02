@@ -6,6 +6,35 @@ import xml.etree.ElementTree as ET
 from generation_data import GameData, RareItem
 
 
+CONDITIONAL_ITEM_SKILLS = {
+    "The Queen's Hunger": {"Bone Offering", "Flesh Offering", "Spirit Offering"},
+}
+
+
+def disable_conditional_item_skill_groups(xml: str) -> tuple[str, list[dict]]:
+    """Disable item-granted skills whose trigger/dependency uptime is not modeled."""
+    root = ET.fromstring(xml)
+    disabled = []
+    for skill in root.findall("./Skills/SkillSet/Skill"):
+        source = skill.get("source", "")
+        item_name = next((name for name in CONDITIONAL_ITEM_SKILLS if name in source), None)
+        if item_name is None:
+            continue
+        group_enabled = skill.get("enabled", "true").lower() != "false"
+        for gem in skill.findall("Gem"):
+            name = gem.get("nameSpec", "")
+            if name not in CONDITIONAL_ITEM_SKILLS[item_name]:
+                continue
+            was_enabled = group_enabled and gem.get("enabled", "true").lower() != "false"
+            skill.set("enabled", "false")
+            gem.set("enabled", "false")
+            if was_enabled:
+                disabled.append({"item": item_name, "skill": name, "wasEnabled": True})
+    if not disabled:
+        return xml, []
+    return ET.tostring(root, encoding="unicode"), disabled
+
+
 def assemble(spec: dict, context: dict, data: GameData, nodes: set[str],
              supports: list[str], items: list[RareItem], masteries: dict[str, int] | None = None,
              uniques: dict[str, str] | None = None,

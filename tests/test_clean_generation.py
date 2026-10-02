@@ -6,7 +6,8 @@ from pathlib import Path
 import tempfile
 from unittest.mock import patch, MagicMock
 
-from build_assembly import assemble
+from build_assembly import assemble, disable_conditional_item_skill_groups
+from build_progression import mapping_unique_packages
 from generation_data import GameData, RareItem, eligible, rare_templates, roll_line, solve_suffixes
 from passive_search import (SearchBudget, graph, paths_from, initial_nodes, mastery_choices, score,
                             recounted_stats, search_tree, tree_pool_target, resource_deficit, heuristic,
@@ -20,7 +21,9 @@ from real_generator import (assess_mechanics, assess_quality, budget_from_prompt
                             support_gain_is_meaningful, support_mechanism_compatible, validate_design,
                             mapping_support_plan, clear_coverage_role, target_dps, complete_design_search,
                             sustained_resource_use, mana_utility_levels, search_mana_utility,
-                            unique_pair_has_weapon_conflict, unique_package_within_budget)
+                            unique_pair_has_weapon_conflict, unique_package_within_budget,
+                            mastery_reserve_for, keystone_reserve_for, keystone_package_candidates,
+                            build_quality_report)
 
 
 def gem(name, tags, support=False):
@@ -704,6 +707,17 @@ class CleanGeneration(unittest.TestCase):
                                 {}, items, data, [definition])
         self.assertEqual([(entry[0], entry[1]) for entry in result], [("The Baron", "Helmet")])
 
+    def test_unique_candidate_is_rejected_when_its_actual_sockets_cannot_fit_utility_gems(self):
+        base = {"type": "Helmet", "subType": "Intelligence", "socketLimit": 4}
+        data = GameData({"gems": [], "bases": {"Hubris Circlet": base}, "mods": []})
+        item = RareItem("Helmet", "Hubris Circlet", base)
+        spec = {"noUniques": False, "budgetChaos": None, "mainLinks": 6,
+                "utility": {"Hatred": "Helmet", "Clarity": "Helmet"},
+                "utilitySockets": 4, "weaponTypes": [], "damageType": "cold"}
+        unique = {"name": "One Socket Crown", "base": "Hubris Circlet", "type": "Helmet",
+                  "subType": "Intelligence", "raw": "Rarity: UNIQUE\nOne Socket Crown\nHubris Circlet\nSockets: B"}
+        self.assertEqual(unique_options({}, spec, {}, [item], data, [unique]), [])
+
     def test_ordinary_jewel_templates_use_pob_jewel_affixes_and_four_mod_cap(self):
         base = {"type": "Jewel", "tags": {"default": True, "jewel": True}}
         metadata = {"gems": [], "bases": {"Cobalt Jewel": base, "Timeless Jewel": base}, "mods": [],
@@ -987,6 +1001,87 @@ class CleanGeneration(unittest.TestCase):
         self.assertEqual(budget.claim(10, reserve=650), 0)
         self.assertTrue(budget.reserve_blocked)
         self.assertFalse(budget.exhausted)
+
+    def test_mastery_reserve_preserves_final_refinement_and_scales_to_budget(self):
+        self.assertEqual(mastery_reserve_for(SearchBudget(2000)), 120)
+        self.assertEqual(mastery_reserve_for(SearchBudget(940)), 120)
+        self.assertEqual(mastery_reserve_for(SearchBudget(939)), 119)
+        self.assertEqual(mastery_reserve_for(SearchBudget(820)), 0)
+
+    def test_conditional_queen_hunger_offerings_are_disabled_idempotently(self):
+        xml = '''<PathOfBuilding><Skills><SkillSet><Skill source="Item:1:The Queen's Hunger, Vaal Regalia" enabled="true">
+          <Gem nameSpec="Bone Offering" enabled="true"/><Gem nameSpec="Flesh Offering" enabled="true"/>
+        </Skill><Skill enabled="true"><Gem nameSpec="Desecrate" enabled="true"/></Skill></SkillSet></Skills></PathOfBuilding>'''
+        safe, disabled = disable_conditional_item_skill_groups(xml)
+        root = ET.fromstring(safe)
+        grants = root.findall("./Skills/SkillSet/Skill")
+        self.assertEqual({entry["skill"] for entry in disabled}, {"Bone Offering", "Flesh Offering"})
+        self.assertEqual(grants[0].get("enabled"), "false")
+        self.assertTrue(all(gem.get("enabled") == "false" for gem in grants[0].findall("Gem")))
+        self.assertEqual(grants[1].get("enabled"), "true")
+        self.assertEqual(disable_conditional_item_skill_groups(safe), (safe, []))
+
+    def test_mapping_packages_are_level_legal_and_fit_the_stage_budget(self):
+        data = GameData({"gems": [], "mods": [], "bases": {
+            "Iron Hat": {"type": "Helmet", "req": {"level": 20}},
+            "Gold Ring": {"type": "Ring", "req": {"level": 10}},
+            "Vaal Regalia": {"type": "Body Armour", "req": {"level": 70}}}})
+        options = [
+            ("Cinder Hood", "Helmet", "Rarity: UNIQUE\nCinder Hood\nIron Hat", 5),
+            ("Ash Ring", "Ring 1", "Rarity: UNIQUE\nAsh Ring\nGold Ring", 8),
+            ("Late Armour", "Body Armour", "Rarity: UNIQUE\nLate Armour\nVaal Regalia", 1),
+        ]
+        packages = mapping_unique_packages(options, {"budgetChaos": 15, "requestedUniques": [],
+                                                      "archetype": "spell", "damageType": "fire"}, data, 50)
+        names = [set(item[0] for item in package) for package in packages]
+        self.assertTrue(any(package == {"Cinder Hood", "Ash Ring"} for package in names))
+        self.assertFalse(any("Late Armour" in package for package in names))
+        self.assertFalse(any(len(package) > 1 and "Cinder Hood" not in package and "Ash Ring" not in package
+                             for package in names))
+
+    def test_keystone_packages_require_a_matching_mechanic(self):
+        fireball = gem("Fireball", ["spell", "projectile", "fire"])
+        srs = gem("Summon Raging Spirit", ["spell", "minion", "fire"])
+        data = GameData({"gems": [fireball, srs], "mods": [], "bases": {}})
+        context = {"tree": {"nodes": {
+            "1": {"classStartIndex": 3, "out": ["2"]},
+            "2": {"in": ["1"], "out": ["3"]},
+            "3": {"in": ["2"], "isKeystone": True, "name": "Elemental Overload"}}}}
+        calc = {"stats": {}, "passives": {"used": 3, "maximum": 5}}
+        spell = {"skill": "Fireball", "archetype": "spell", "damageType": "fire", "focus": "damage"}
+        minion = {**spell, "skill": "Summon Raging Spirit", "archetype": "minion"}
+        found = keystone_package_candidates(context, spell, calc, data, [], {"1"})
+        self.assertEqual([entry[0] for entry in found], ["Elemental Overload"])
+        self.assertEqual(keystone_package_candidates(context, minion, calc, data, [], {"1"}), [])
+        self.assertEqual(keystone_reserve_for(SearchBudget(2000)), 80)
+
+    def test_keystone_package_can_trade_a_low_value_branch_for_its_connected_path(self):
+        data = GameData({"gems": [gem("Fireball", ["spell", "fire"])], "mods": [], "bases": {}})
+        context = {"tree": {"nodes": {
+            "1": {"classStartIndex": 3, "out": ["2", "3"]},
+            "2": {"in": ["1"]},
+            "3": {"in": ["1"], "out": ["4"], "isNotable": True, "group": 7},
+            "4": {"in": ["3"], "isKeystone": True, "name": "Elemental Overload"}}}}
+        spec = {"skill": "Fireball", "archetype": "spell", "damageType": "fire", "focus": "damage"}
+        packages = keystone_package_candidates(context, spec,
+                    {"stats": {}, "passives": {"used": 3, "maximum": 3}}, data, [], {"1", "2", "3"})
+        self.assertTrue(any(entry[0] == "Elemental Overload" and entry[4] == ["2"] and entry[2] == ["4"]
+                            for entry in packages))
+
+    def test_quality_report_separates_readiness_and_price_coverage(self):
+        data = GameData({"gems": [], "mods": [], "bases": {}})
+        xml = '<PathOfBuilding><Build pantheonMajorGod="None" pantheonMinorGod="None"/><Skills><SkillSet><Skill includeInFullDPS="true"><Gem gemId="Fireball"/></Skill></SkillSet></Skills></PathOfBuilding>'
+        report = build_quality_report(xml, {"level": 90, "utility": {}, "expectedCurse": None}, {},
+                                      {"stats": {"Life": 4000, "EnergyShield": 0, "ChaosResist": -36,
+                                                  "TotalEHP": 10000, "Armour": 1000},
+                                       "passives": {"used": 100, "maximum": 113}},
+                                      data, {"complete": False, "unknown": [{"slot": "Ring 1"}],
+                                             "pricedSubtotalChaos": 0, "budgetStatus": "unverified"}, [])
+        self.assertEqual(report["completeness"]["status"], "gaps")
+        self.assertEqual(report["encounterReadiness"]["status"], "review_gaps")
+        self.assertIn("major and minor Pantheons are unselected", report["encounterReadiness"]["gaps"])
+        self.assertFalse(report["priceCoverage"]["complete"])
+        self.assertNotIn("validation", report)
 
     def test_fully_consumed_search_budget_is_reported_as_exhausted(self):
         budget = SearchBudget(2000)
