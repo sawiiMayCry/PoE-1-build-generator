@@ -169,6 +169,7 @@ def market_data(league: str) -> dict:
         prices: dict[str, list[float]] = {}
         listings: dict[str, list[dict]] = {}
         errors = []
+        category_errors: dict[str, str] = {}
         for kind in ("UniqueWeapon", "UniqueArmour", "UniqueAccessory", "UniqueFlask", "UniqueJewel"):
             try:
                 result = json_get(f"{base}/item/overview?league={query}&type={kind}")
@@ -180,12 +181,18 @@ def market_data(league: str) -> dict:
                             "chaos": float(value),
                             "variant": line.get("variant") or line.get("variantName"),
                             "links": line.get("links") or line.get("linkCount"),
+                            "corrupted": line.get("corrupted"),
+                            "listingCount": line.get("listingCount", line.get("count")),
+                            "baseType": line.get("baseType"),
+                            "category": kind,
                             "detailsId": line.get("detailsId"),
                         })
             except Exception as exc:
                 errors.append(f"{kind}: {exc}")
+                category_errors[kind] = str(exc)
         return {"league": league, "divineChaos": float(divine), "prices": prices, "listings": listings,
-                "updated": int(time.time()), "source": "poe.ninja economy API", "errors": errors}
+                "updated": int(time.time()), "source": "poe.ninja economy API", "errors": errors,
+                "categoryErrors": category_errors, "schema": 2}
     return cached("market:" + league, 300, load)
 
 

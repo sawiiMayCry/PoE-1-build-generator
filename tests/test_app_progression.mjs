@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+const source = fs.readFileSync(new URL('../web/app.js', import.meta.url), 'utf8');
 new vm.Script(source);
 class Element {
   constructor(tag, className, value) { this.tag = tag; this.className = className; this.textContent = value; this.children = []; }
@@ -12,7 +12,7 @@ class Element {
 }
 const sandbox = {el: (...args) => new Element(...args), fmt: String, Option: function(text, value) { this.text = text; this.value = value; }};
 vm.createContext(sandbox);
-vm.runInContext(source.slice(source.indexOf('function progressionCard('), source.indexOf('function render(')), sandbox);
+vm.runInContext(source.slice(source.indexOf('const SLOT_ORDER'), source.indexOf('function defenseMetrics(')), sandbox);
 const stages = [
   {title: 'Act 1 - Level 12', level: 12, passives: 13, passiveBudget: 13, ascendancyPoints: 0, gems: ['Summon Skeletons'],
    gemLevels: {'Summon Skeletons': 1}, stats: {Life: 400, EnergyShield: 50}, instructions: ['Use normal Skeletons'], gear: [{slot: 'Helmet', base: 'Vine Circlet'}]},

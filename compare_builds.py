@@ -8,6 +8,7 @@ from pathlib import Path
 
 from build_generator import quote, validate_structure
 from build_progression import select_stage
+from mechanics import FALLBACK_MINION_MODEL
 from passive_search import temporary_minion_population
 from pob_engine import calculate_with_pob
 
@@ -75,8 +76,13 @@ def summarize(path: Path, level: int, skill: str, minions: int) -> dict:
     if used > maximum:
         raise ValueError(f"{path} is not a legal level-{level} benchmark: it allocates {used} passive points, "
                          f"but only {maximum} are available")
-    population = temporary_minion_population(calculation["stats"],
-                                            {"skill": skill, "minionCount": minions})
+    stats = calculation["stats"]
+    # No gem metadata here: fall back to PoB's own outputs when the skill is not in the known table.
+    pob_model = (("temporary" if float(stats.get("Duration", 0) or 0) > 0 else "permanent")
+                 if float(stats.get("ActiveMinionLimit", 0) or 0) > 0 else None)
+    population = temporary_minion_population(
+        stats, {"skill": skill, "minionCount": minions,
+                "minionModel": FALLBACK_MINION_MODEL.get(skill) or pob_model})
     output = calculation["stats"]
     sustainability = None
     if population is not None:

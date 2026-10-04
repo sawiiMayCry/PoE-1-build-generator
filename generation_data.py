@@ -67,6 +67,50 @@ class RareItem:
         return "\n".join(lines)
 
 
+# PoB skill types (Worker metadata ``skillTypes``) that mark a skill as a buff/utility rather than a
+# damage source: an offering or aura only modifies other skills, whatever its generic tags say.
+NON_DAMAGE_SKILL_TYPES = {"Offering", "Aura", "Warcry", "Herald", "Guard", "Blessing", "Banner",
+                          "Stance", "Meta"}
+
+
+NON_COMBAT_STAT = re.compile(r"dropped_item|item_found|monster_dropped|experience_gain|_quantity|_rarity")
+
+
+def support_is_noncombat(gem: dict) -> bool:
+    """A support is unusable in a damage link when PoB marks it legacy or its only stats are item-drop
+    or experience effects (decided from the gem's own stat ids, not its name)."""
+    if gem.get("legacy"):
+        return True
+    stats = list(gem.get("statIds") or ())
+    return bool(stats) and all(NON_COMBAT_STAT.search(stat) for stat in stats)
+
+
+def is_main_skill_candidate(name: str, gem: dict) -> bool:
+    """Whether a gem can be a build's main (damage) skill, decided from PoB data.
+
+    Uses PoB skill types when the metadata carries them (offerings, auras, warcries and the like are
+    excluded; a minion-tagged skill must actually create minions), falling back to gem tags for older
+    metadata. Hexes qualify only when they deal damage.
+    """
+    if gem.get("support") or gem.get("unsupported"):
+        return False
+    tags = set(gem.get("tags", {}))
+    skill_types = set(gem.get("skillTypes") or ())
+    if "base_deal_no_damage" in set(gem.get("statIds") or ()):
+        return False   # PoB's own flag for skills that deal no damage
+    if skill_types:
+        if skill_types & NON_DAMAGE_SKILL_TYPES:
+            return False
+        if "minion" in tags and "createsMinions" in gem and not gem["createsMinions"]:
+            return False
+        if "Buff" in skill_types and not gem.get("baseEffectiveness") and "CreatesMinion" not in skill_types:
+            return False
+    if tags & UTILITY_TAGS:
+        damaging_hex = bool(tags & {"hex", "curse", "mark"}) and "DamageOverTime" in skill_types             and bool(gem.get("baseEffectiveness"))
+        return damaging_hex or name.startswith(("Bane", "Hexblast"))
+    return True
+
+
 class GameData:
     def __init__(self, metadata: dict):
         self.gems = {gem["name"]: gem for gem in sorted(metadata["gems"], key=lambda g: g["id"])
@@ -76,10 +120,7 @@ class GameData:
         self.mods = metadata["mods"]
         self.jewel_mods = metadata.get("jewelMods", [])
         self.unique_items = metadata.get("uniqueItems")
-        self.main_names = sorted(name for name, gem in self.gems.items()
-                                 if not gem.get("support") and not gem.get("unsupported")
-                                 and (not set(gem.get("tags", {})) & UTILITY_TAGS or
-                                      name.startswith(("Bane", "Hexblast"))))
+        self.main_names = sorted(name for name, gem in self.gems.items() if is_main_skill_candidate(name, gem))
 
     def gem(self, name: str) -> dict:
         match = next((gem for key, gem in self.gems.items() if key.casefold() == name.casefold()), None)
@@ -107,7 +148,8 @@ class GameData:
 
 def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
                    character_level: int | None = None, damage_type: str = "physical",
-                   base_damage_type: str | None = None, focus: str = "balanced") -> list[RareItem]:
+                   base_damage_type: str | None = None, focus: str = "balanced",
+                   defense_model: str = "hybrid") -> list[RareItem]:
     weapon_bases = {"Wand": "Prophecy Wand", "Bow": "Thicket Bow", "Staff": "Judgement Staff",
                     "Claw": "Imperial Claw", "Dagger": "Imperial Skean",
                     "One Handed Sword": "Jewelled Foil", "One Handed Axe": "Siege Axe",
@@ -132,6 +174,13 @@ def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
                        if entry["type"] == wanted["type"] and entry.get("subType") == wanted.get("subType")
                        and entry.get("tags", {}).get("default")
                        and base_required_level(entry) <= character_level]
+            ordinary = [row for row in choices if not row[1].get("tags", {}).get("experimental_base")]
+            choices = ordinary or choices      # league-crafted experimental bases (own sockets/implicits)
+            if slot in {"Belt", "Amulet", "Ring 1", "Ring 2"}:
+                # Jewellery-slot bases with their own socket (abyss belts) would leave a socket the
+                # skill plan cannot use; prefer socketless bases of the same type.
+                plain = [row for row in choices if not row[1].get("socketLimit")]
+                choices = plain or choices
             if not choices:
                 raise ValueError(f"No level-{character_level} base for {slot}")
             base, _ = max(choices, key=lambda row: (base_required_level(row[1]), row[0]))
@@ -157,7 +206,13 @@ def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
                 data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Physical Damage", 120 * scale)
                 data.add_mod(item, r"(\d+(?:\.\d+)?)% increased Attack Speed", 15 * scale)
         else:
-            data.add_mod(item, r"\+(\d+(?:\.\d+)?) to maximum Life", 110 * scale)
+            if defense_model == "ci":
+                # Chaos Inoculation sets maximum life to 1: maximum-life affixes
+                # are worthless, so jewelry and armour carry ES instead.
+                if data.bases[base]["type"] not in {"Helmet", "Body Armour", "Gloves", "Boots", "Shield"}:
+                    data.add_mod(item, r"\+(\d+(?:\.\d+)?) to maximum Energy Shield", 60 * scale)
+            else:
+                data.add_mod(item, r"\+(\d+(?:\.\d+)?) to maximum Life", 110 * scale)
             if slot == "Amulet" and archetype in {"spell", "ignite", "dot"}:
                 data.add_mod(item, rf"\+(\d+(?:\.\d+)?) to Level of all {title_base_damage} Skill Gems", 1)
                 if archetype in {"ignite", "dot"}:
@@ -184,7 +239,8 @@ def rare_templates(data: GameData, archetype: str, weapon_type: str = "Wand", *,
     return result
 
 
-def solve_suffixes(items: list[RareItem], data: GameData, output: dict, *, resistance_target: int = 75) -> int:
+def solve_suffixes(items: list[RareItem], data: GameData, output: dict, *, resistance_target: int = 75,
+                   chaos_target: int | None = None) -> int:
     """Allocate only needed resistance/attribute affixes within legal slot limits.
 
     Deficits come from a real PoB calculation. Each pass adds one affix at a
@@ -195,8 +251,12 @@ def solve_suffixes(items: list[RareItem], data: GameData, output: dict, *, resis
                 for element in ("Fire", "Cold", "Lightning")}
     deficits.update({attr: max(0, output.get("Req" + attr, 0) - output.get(attr, 0))
                      for attr in ("Str", "Dex", "Int")})
+    if chaos_target is not None:
+        # Chaos resistance is a hard repair target (not a nice-to-have): the deficit is measured by PoB
+        # like the elemental ones and repaired with legal single-line "+N% to Chaos Resistance" affixes.
+        deficits["Chaos"] = max(0, chaos_target - output.get("ChaosResist", -60))
     patterns = {element: rf"\+(\d+(?:\.\d+)?)% to {element} Resistance"
-                for element in ("Fire", "Cold", "Lightning")}
+                for element in ("Fire", "Cold", "Lightning", "Chaos")}
     patterns.update({attr: rf"\+(\d+(?:\.\d+)?) to {name}"
                      for attr, name in (("Str", "Strength"), ("Dex", "Dexterity"), ("Int", "Intelligence"))})
     added = 0
@@ -205,7 +265,7 @@ def solve_suffixes(items: list[RareItem], data: GameData, output: dict, *, resis
         for requirement, deficit in deficits.items():
             if deficit <= 0:
                 continue
-            target = 35 if requirement in {"Fire", "Cold", "Lightning"} else 45
+            target = 35 if requirement in {"Fire", "Cold", "Lightning", "Chaos"} else 45
             choices = [(item, data.pick_mod(item, patterns[requirement], target)) for item in items
                        if not item.slot.startswith("Flask ")]
             options[requirement] = [(item, mod) for item, mod in choices if mod]
@@ -217,7 +277,7 @@ def solve_suffixes(items: list[RareItem], data: GameData, output: dict, *, resis
         def rank(choice):
             item, mod = choice
             jewelry = item.slot in {"Amulet", "Ring 1", "Ring 2", "Belt"}
-            return (jewelry if key in {"Fire", "Cold", "Lightning"} else not jewelry,
+            return (jewelry if key in {"Fire", "Cold", "Lightning", "Chaos"} else not jewelry,
                     len(item.mods), item.slot, mod["id"])
         item, mod = min(options[key], key=rank)
         item.mods.append(mod)

@@ -6,8 +6,36 @@ import re
 from collections import deque
 
 from build_generator import offense_value
+from mechanics import minion_model, minion_population
 
 DEFAULT_UTILITY_RESOURCE_RESERVE = 0.15
+CHANNEL_CYCLE_SECONDS = 1.0   # modeled assumption: a channelled spell is paid for ~once per second
+
+
+def paid_use_rate(output: dict, spec: dict) -> float:
+    """Paid uses per second. PoB's Speed is the cast rate; a channelled skill (Winter Orb,
+    Vaal-less channellers) is cast once and held, so cost is paid per channel cycle, not per
+    tooltip cast. All other skills pay on every cast."""
+    speed = max(0.0, float(output.get("Speed", 0) or 0))
+    if spec.get("channelled"):
+        return min(speed, 1.0 / CHANNEL_CYCLE_SECONDS) if speed else 1.0 / CHANNEL_CYCLE_SECONDS
+    return speed
+
+
+def is_ci(spec: dict) -> bool:
+    """Chaos Inoculation recipe: maximum life is 1 and ES is the whole pool."""
+    return spec.get("defenseModel") == "ci"
+
+
+def chaos_inoculation_path(context: dict, start: str) -> list[str]:
+    """Shortest connected path from the class start to the Chaos Inoculation keystone."""
+    nodes = context["tree"]["nodes"]
+    target = next((key for key, node in nodes.items() if node.get("name") == "Chaos Inoculation"
+                   and node.get("isKeystone")), None)
+    if target is None:
+        return []
+    adjacency = graph(nodes, lambda node: not node.get("ascendancyName"))
+    return paths_from({start}, adjacency).get(target, [])
 
 
 def tree_pool_target(spec: dict) -> int:
@@ -16,34 +44,19 @@ def tree_pool_target(spec: dict) -> int:
 
 
 def tree_defenses_met(output: dict, spec: dict) -> bool:
-    pool = float(output.get("Life", 0) or 0) + float(output.get("EnergyShield", 0) or 0)
+    # Under CI the life pool is exactly 1; only ES counts towards the target.
+    pool = (0.0 if is_ci(spec) else float(output.get("Life", 0) or 0)) + float(output.get("EnergyShield", 0) or 0)
     return pool >= tree_pool_target(spec) and float(output.get("TotalEHP", 0) or 0) >= 15000
 
 
 def temporary_minion_population(output: dict, spec: dict) -> tuple[int, bool] | None:
-    skill = spec.get("skill")
-    if skill == "Raise Zombie":
-        count = max(1, int(output.get("ActiveMinionLimit", spec.get("minionCount", 1)) or
-                           spec.get("minionCount", 1)))
-        return count, True
-    if skill in {"Summon Raging Spirit", "Animate Weapon"}:
-        speed = max(0.0, float(output.get("Speed", 0) or 0))
-        duration = max(0.0, float(output.get("Duration", 0) or 0))
-        fallback_limit = 20 if skill == "Summon Raging Spirit" else int(spec.get("minionCount", 1) or 1)
-        limit = max(1, int(output.get("ActiveMinionLimit", fallback_limit) or fallback_limit))
-        rates = [speed]
-        for cost_key, regen_key in (("ManaCost", "ManaRegen"), ("LifeCost", "LifeRegenRecovery")):
-            cost = max(0.0, float(output.get(cost_key, 0) or 0))
-            if cost > 0:
-                regen = max(0.0, float(output.get(regen_key, 0) or 0))
-                reserve = min(0.5, max(0.0, float(spec.get(
-                    "resourceReserveFraction", DEFAULT_UTILITY_RESOURCE_RESERVE))))
-                regen *= 1 - reserve
-                rates.append(regen / cost)
-        rate = max(0.0, min(rates))
-        sustainable_count = rate * duration
-        return max(1, min(limit, int(sustainable_count))), sustainable_count >= 1
-    return None
+    """(population, sustainable) for any minion skill, derived from PoB outputs (see mechanics)."""
+    return minion_population(output, spec)
+
+
+def skeleton_population(output: dict, spec: dict) -> tuple[int, bool]:
+    """Backwards-compatible name: the generic temporary-minion model applied to a temporary summon."""
+    return minion_population(output, {**spec, "minionModel": "temporary"})
 
 
 def candidate_minion_count(output: dict, spec: dict) -> int | None:
@@ -53,17 +66,16 @@ def candidate_minion_count(output: dict, spec: dict) -> int | None:
 
 def sustained_resource_use(output: dict, spec: dict) -> dict | None:
     """Assess continuous cast costs without treating temporary minions as permanent."""
-    profile = spec.get("mechanicProfile", {})
-    skill = spec.get("skill")
-    if profile.get("name") == "srs_necromancer" or skill in {"Summon Raging Spirit", "Animate Weapon"}:
+    model = minion_model(spec)
+    if model == "temporary":
         population = temporary_minion_population(output, spec)
         count, sustainable = population if population is not None else (0, False)
         return {"sustainable": sustainable, "population": count,
                 "model": "cast rate, duration, resource sustain and minion limit"}
-    if profile.get("name") == "raise_zombie_necromancer" or skill == "Raise Zombie":
+    if model == "permanent":
         return None
 
-    speed = max(0.0, float(output.get("Speed", 0) or 0))
+    speed = paid_use_rate(output, spec)
     checks = []
     for label, cost_key, regen_key in (("mana", "ManaCost", "ManaRegen"),
                                        ("life", "LifeCost", "LifeRegenRecovery")):
@@ -113,9 +125,9 @@ def candidate_score(output: dict, spec: dict) -> float:
 
 def resource_deficit(output: dict, spec: dict) -> tuple[float, float] | None:
     """Return the largest active-cast resource rate and its available rate."""
-    if spec.get("archetype") == "minion" or spec.get("skill") == "Raise Zombie":
+    if spec.get("archetype") == "minion" or minion_model(spec) == "permanent":
         return None
-    speed = max(0.0, float(output.get("Speed", 0) or 0))
+    speed = paid_use_rate(output, spec)
     deficits = []
     for cost_key, regen_key in (("ManaCost", "ManaRegen"),
                                 ("LifeCost", "LifeRegenRecovery")):
@@ -136,6 +148,29 @@ class SearchBudget:
         self.used = 0
         self.exhausted = False
         self.reserve_blocked = False
+        self.shares: dict[str, dict] = {}   # name -> {"reserved", "used", "skipped"}
+
+    def share(self, name: str, reserved: int = 0) -> dict:
+        entry = self.shares.setdefault(name, {"reserved": reserved, "used": 0, "skipped": ""})
+        if reserved:
+            entry["reserved"] = reserved
+        return entry
+
+    def extend(self, name: str, count: int) -> None:
+        """Fund a later phase beyond the design limit; the share is recorded, not hidden."""
+        self.limit += count
+        self.exhausted = self.used >= self.limit
+        entry = self.share(name, count)
+        entry["fundedBeyondDesignLimit"] = entry.get("fundedBeyondDesignLimit", 0) + count
+
+    def spend(self, name: str, count: int = 1, reserve: int = 0) -> int:
+        """claim() attributed to a named phase share (visible in diagnostics)."""
+        allowed = self.claim(count, reserve=reserve)
+        entry = self.share(name)
+        entry["used"] += allowed
+        if allowed < count:
+            entry["skipped"] = "budget exhausted" if self.exhausted else "blocked by later-phase reserve"
+        return allowed
 
     def claim(self, count: int = 1, reserve: int = 0) -> int:
         absolute_remaining = max(0, self.limit - self.used)
@@ -208,7 +243,10 @@ def initial_nodes(context: dict, spec: dict) -> set[str]:
             remaining -= len(path)
     # Leave points free when the installed tree lacks a preferred notable.
     # An arbitrary nearby notable is not a mechanic-compatible fallback.
-    return {start, *allocated}
+    result = {start, *allocated}
+    if is_ci(spec):
+        result.update(chaos_inoculation_path(context, start))
+    return result
 
 
 def heuristic(node: dict, spec: dict) -> float:
@@ -233,10 +271,15 @@ def heuristic(node: dict, spec: dict) -> float:
         if spec["archetype"] == "ignite" and ("burning" in text or "ignite" in text or "over time" in text):
             score += 6
     defense_scale = 0.2 if spec.get("_defensesMet") else 1
-    if "maximum life" in text and "minion" not in text:
+    ci = is_ci(spec)
+    if "maximum life" in text and "minion" not in text and not ci:
+        # Life is never a goal under CI (the pool is 1); keep it only for
+        # recipes whose damage or defense actually scales from maximum life.
         score += defense_scale * (8 if spec["focus"] == "defense" else 5)
     if "energy shield" in text and "minion" not in text:
-        score += defense_scale * 4
+        score += defense_scale * (7 if ci else 4)
+    if ci and "chaos resistance" in text:
+        score -= 1   # chaos damage is not taken; do not spend points on it
     if any(term in text for term in ("armour", "evasion", "chance to block", "spell suppression",
                                      "damage taken as", "reduced damage taken", "maximum resistances")):
         score += defense_scale * 4
@@ -256,7 +299,7 @@ def score(output: dict, spec: dict) -> float:
     dps = (output.get("IgniteDPS", 0) if spec["archetype"] == "ignite" else
            max(output.get("FullDotDPS", 0), output.get("TotalDotDPS", 0))
            if spec["archetype"] == "dot" else offense_value(output))
-    pool = output.get("Life", 0) + output.get("EnergyShield", 0)
+    pool = (0 if is_ci(spec) else output.get("Life", 0)) + output.get("EnergyShield", 0)
     weight = {"damage": 0.35, "balanced": 0.85, "defense": 1.8}[spec["focus"]]
     # Continue valuing real life/ES after the focus-specific target has been
     # reached. A capped pool score made extra defense nearly worthless and
@@ -363,7 +406,8 @@ def expand_tree_beam(context, spec, beam, render, worker, adjacency, reserve, bu
 
 
 def search_tree(context, spec, allocated, render, worker, stage, *, reserve=4, trace=None, budget=None,
-                baseline_calc=None, budget_reserve=650):
+                baseline_calc=None, budget_reserve=650, shortlist_size=72, use_beam=True,
+                protected=frozenset()):
     nodes = context["tree"]["nodes"]
     adjacency = graph(nodes, lambda node: not node.get("ascendancyName") and not node.get("isMastery")
                       and not node.get("isProxy") and not node.get("isJewelSocket")
@@ -373,7 +417,7 @@ def search_tree(context, spec, allocated, render, worker, stage, *, reserve=4, t
     baseline = baseline_calc or worker.request("calculate", xml=render(allocated))
     # PoB counts bandit-granted points and excludes the class start for us.
     normal_start = next(key for key in allocated if nodes[key].get("classStartIndex") == 3)
-    if baseline["passives"]["used"] < baseline["passives"]["maximum"] - reserve:
+    if use_beam and baseline["passives"]["used"] < baseline["passives"]["maximum"] - reserve:
         beam = expand_tree_beam(context, spec, [{"nodes": set(allocated), "calc": baseline,
                                                 "score": candidate_score(baseline["stats"], spec)}],
                                 render, worker, adjacency, reserve, budget, budget_reserve, trace)
@@ -405,7 +449,7 @@ def search_tree(context, spec, allocated, render, worker, stage, *, reserve=4, t
             hint = sum(heuristic(nodes[value], hints) for value in path) / len(path)
             if hint > 0 and (node.get("isNotable") or len(path) == 1 or heuristic(node, hints) >= 3):
                 candidates.append((hint, key, path))
-        shortlist = sorted(candidates, key=lambda row: (-row[0], int(row[1])))[:72]
+        shortlist = sorted(candidates, key=lambda row: (-row[0], int(row[1])))[:shortlist_size]
         if not shortlist:
             break
         lookup = {key: path for _, key, path in shortlist}
@@ -468,7 +512,9 @@ def search_tree(context, spec, allocated, render, worker, stage, *, reserve=4, t
         for key in sorted(allocated, key=int):
             node = nodes.get(key, {})
             if (node.get("classStartIndex") == 3 or node.get("ascendancyName")
-                    or node.get("isMastery") or node.get("isJewelSocket")):
+                    or node.get("isMastery") or node.get("isJewelSocket")
+                    or node.get("isKeystone")   # a deliberately allocated keystone (e.g. CI) is never "neutral"
+                    or key in protected):       # e.g. the connecting path of an equipped jewel socket
                 continue
             neighbors = adjacency.get(key, set()) & allocated
             if len(neighbors) == 1:
@@ -504,3 +550,20 @@ def mastery_choices(context: dict, allocated: set[str]):
     groups = {node.get("group") for key, node in nodes.items() if key in allocated and node.get("isNotable")}
     return [(key, node.get("masteryEffects", [])) for key, node in nodes.items()
             if node.get("isMastery") and node.get("group") in groups and node.get("masteryEffects")]
+
+
+def jewel_socket_paths(context: dict, allocated: set[str], sockets) -> set[str]:
+    """Allocated nodes that connect the class start to the given (equipped) jewel sockets."""
+    nodes = context["tree"]["nodes"]
+    adjacency = graph(nodes, lambda node: not node.get("ascendancyName") and not node.get("isMastery")
+                      and not node.get("isProxy")
+                      and ("classStartIndex" not in node or node["classStartIndex"] == 3))
+    start = next((key for key in allocated if nodes.get(key, {}).get("classStartIndex") == 3), None)
+    if start is None:
+        return set()
+    restricted = {key: neighbors & allocated for key, neighbors in adjacency.items() if key in allocated}
+    paths = paths_from({start}, restricted)
+    protected = set()
+    for socket in sockets:
+        protected.update(paths.get(socket, []))
+    return protected

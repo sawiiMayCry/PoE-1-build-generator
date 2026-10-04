@@ -28,6 +28,7 @@ JOBS: dict[str, dict] = {}
 MAX_FINISHED_JOBS = 50
 BUILDS: dict[str, dict] = {}
 LOCK = threading.RLock()
+WEB = ROOT / "web"
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8"),
           "/app.css": ("app.css", "text/css; charset=utf-8")}
@@ -172,7 +173,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, encode_pob(build["_xml"]), "text/plain; charset=utf-8"); return
             if parsed.path in STATIC:
                 filename, content_type = STATIC[parsed.path]
-                self.reply(200, (ROOT / filename).read_bytes(), content_type); return
+                self.reply(200, (WEB / filename).read_bytes(), content_type); return
             self.reply(404, {"error": "Not found"})
         except Exception:
             self.reply(500, {"error": "The local server could not complete this request"})
