@@ -2,6 +2,14 @@
 
 Describe a Witch build in plain language. Ollama interprets the request; deterministic code generates a fresh Path of Building export from current gem, passive and item definitions, scores candidates in your installed PoB Community, validates the exact result, prices equipment and shares it on pobb.in.
 
+## Project layout
+
+- `server.py` and `start.bat` start the local app; the Python modules beside them implement generation, validation, pricing and service access.
+- `web/` holds the served page, JavaScript and CSS. The browser paths remain `/`, `/app.js` and `/app.css`.
+- `web/archive/` holds earlier stylesheets that the current page does not load.
+- `pob_bridge/` contains the Lua bridge to Path of Building.
+- `tests/` contains regression checks and fixtures; `data/` contains local snapshots and generated builds.
+
 ## Start on Windows
 
 Install and update [Path of Building Community](https://github.com/PathOfBuildingCommunity/PathOfBuilding), [Ollama](https://ollama.com/) and Python 3.10 or later. Pull a local model, for example `ollama pull qwen2.5:7b`. Start Ollama, then double-click `start.bat` or run `python server.py`. Open <http://127.0.0.1:4173>.
@@ -80,3 +88,20 @@ python -m unittest discover -s tests -v
 The benchmark compares warm calculation outputs with the original cold engine. Pure progression tests check quest/lab budgets, gem unlocks, low-level affix limits, connected allocation order and loadout item-ID remapping. Opt-in real-engine tests check alternating builds, concurrent callers, export roundtrips, error recovery and restoration of process state. Verification XML and reports are written to `data/verification/` (ignored by Git).
 
 PoB calculation requires Windows and PoB's bundled `lua51.dll`. The server binds to localhost, rejects a second listener on the same port and accepts changes only as JSON from the local page.
+
+## Skills, links, unique pricing and the app report
+
+- **Skill groups** (`skill_packages.py`, `skill_planner.py`): the planner builds a complete six-gem main link
+  (`plan_main_link`, filler-free, resource deficits reported as repairs rather than dropping supports) and
+  supporting groups (movement, guard, reservation, defense, herald, curse delivery, minion helpers) packed onto
+  real linked sockets. Each package is justified by PoB stats or a declared role; omissions carry reasons.
+  `build_assembly.assemble(..., skill_groups=...)` serializes groups per instance (level/quality/enabled),
+  validates physical sockets (`SocketConflict`) and never emits item-granted skills.
+- **Counts** come only from the final XML (`loadout_summary.py`); item-granted skills such as `EnemyExplode`
+  are reported separately from socketed gems.
+- **Prices** (`unique_pricing.py`): one resolver for selection and display. Only uniques (equipment, jewels,
+  flasks) are priced; rares, gems and link crafting are excluded scope, not missing quotes. A link-priced
+  six-link needs an actual six-link quote; variants and bases never fall back to a cheaper listing.
+- **Progression**: Mapping and Endgame are six-links; stage summaries (gear, groups, jewels, unique prices) are
+  derived from each stage's exported XML. Chaos Inoculation is deferred to the Endgame respec.
+- `python validate_skill_packages.py data/generated/<id>.json` re-plans a saved build with installed PoB.

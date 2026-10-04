@@ -16,6 +16,8 @@ import zlib
 
 from pob_engine import calculate_with_pob
 from services import game_context, market_data, reference_xml
+from loadout_summary import parse_item, summarize_loadout
+from unique_pricing import price_unique_equipment
 
 WINTER_REFS = ("h8klSvqllefw", "W4yCI3RRdniV")
 SRS_REFS = ("cT7EOnsriDz5", "7_6IS6EVRZfT")
@@ -365,7 +367,8 @@ def construct_srs(core_xml: str, donor_xml: str, context: dict, preference: str)
                  "method": "Curated current-version Fire SRS tree, main links, and gear recombination"}
 
 
-def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, skill: str = SKILL) -> tuple[list[dict], dict]:
+def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, skill: str = SKILL,
+                       required_main_links: int | None = None) -> tuple[list[dict], dict]:
     root = ET.fromstring(xml)
     build = root.find("Build")
     if build is None:
@@ -405,6 +408,10 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
     bad_gems = [g.get("nameSpec") for g in gems if not g.get("gemId") or f'"{g.get("gemId")}"' not in gem_data]
     check("Main skill and gem IDs", len(gems) >= 2 and any(g.get("nameSpec") == skill for g in gems) and not bad_gems,
           f"Main link needs {skill} and at least one known, useful support; unknown: {bad_gems}")
+    if required_main_links is not None:
+        socketed = [g for g in gems if g.get("gemId")]
+        check("Main link size", len(socketed) == required_main_links,
+              f"Main group has {len(socketed)} gems; this stage requires exactly {required_main_links}")
     items, slots = _items_by_slot(root)
     missing_slots = [name for name in REQUIRED_SLOTS if name not in slots or slots[name][1] is None]
     check("Complete equipment", not missing_slots, f"Missing equipped slots: {missing_slots}")
@@ -454,8 +461,10 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
             if 0 <= index < len(variants) and variants[index] != "Current":
                 variant = variants[index]
         sockets = _socket_colors(item.text or "")
+        parsed = parse_item(item.text)
         gear.append({"slot": name, "rarity": rarity, "name": item_name, "base": base,
-                     "variant": variant, "links": len(sockets) if sockets else None})
+                     "variant": variant, "links": len(sockets) if sockets else None,
+                     "corrupted": parsed["corrupted"], "sockets": parsed.get("socketCount", 0)})
     jewel_failures = []
     for socket in spec.findall("./Sockets/Socket"):
         node_id, item_id = socket.get("nodeId"), socket.get("itemId")
@@ -476,14 +485,29 @@ def validate_structure(xml: str, context: dict, ascendancy: str = ASCENDANCY, sk
         if rarity == "unique" and not known_unique_name(item_name):
             jewel_failures.append(node_id)
             continue
+        parsed = parse_item(item.text)
         gear.append({"slot": "Jewel " + node_id, "rarity": rarity, "name": item_name,
-                     "base": base, "variant": None, "links": None})
+                     "base": base, "variant": parsed["variant"], "links": None,
+                     "corrupted": parsed["corrupted"], "sockets": 0})
     check("Jewel socket assignments", not jewel_failures,
           f"Socketed jewels require distinct allocated ordinary sockets and installed jewel bases; invalid: {jewel_failures}")
     check("Current item definitions", not invalid_items, f"Unknown PoB item definitions: {invalid_items[:6]}")
     check("Configuration", root.find("./Config/ConfigSet") is not None, "PoB configuration set is required")
+    loadout = summarize_loadout(root)
     return checks, {"level": level, "gear": gear, "gems": [g.get("nameSpec") for g in gems],
-                    "treeNodes": len(nodes), "ascendancyPoints": paid_asc}
+                    "treeNodes": len(nodes), "ascendancyPoints": paid_asc,
+                    "socketedGemCount": loadout["socketedGemCount"],
+                    "skillGroups": [{"index": group["index"], "slot": group["slot"], "label": group["label"],
+                                     "isMain": group["isMain"], "itemGranted": group["itemGranted"],
+                                     "mainActive": group["mainActive"],
+                                     "gems": [{key: gem[key] for key in ("name", "kind", "level", "quality", "enabled")}
+                                              for gem in group["gems"]]}
+                                    for group in loadout["groups"]],
+                    "itemGrantedSkills": loadout["itemGranted"],
+                    "jewels": loadout["jewels"]}
+
+
+LIFE_RESERVATION_LIMIT = 0.35
 
 
 def validate_calculation(stats: dict) -> list[dict]:
@@ -495,6 +519,11 @@ def validate_calculation(stats: dict) -> list[dict]:
         {"name": "Endgame health pool", "passed": life >= 3000, "reason": f"Life plus energy shield: {life:,.0f}; minimum for this recipe: 3,000"},
         {"name": "Main skill offense", "passed": offense > 0, "reason": f"PoB calculated {offense:,.0f} DPS"},
     ]
+    life_max = float(output.get("Life", 0) or 0)
+    life_reserved = float(output.get("LifeReserved", 0) or 0)
+    checks.append({"name": "Life reservation", "passed": life_max <= 0 or life_reserved <= LIFE_RESERVATION_LIMIT * life_max,
+                   "reason": f"{life_reserved:,.0f} of {life_max:,.0f} maximum life is reserved "
+                             f"(limit {LIFE_RESERVATION_LIMIT:.0%}; a Blood-Magic style glass cannon is not a default recipe)"})
     points = stats.get("passives", {})
     used, maximum = points.get("used"), points.get("maximum")
     asc, secondary = points.get("ascendancy"), points.get("secondaryAscendancy")
@@ -523,40 +552,14 @@ def offense_value(output: dict) -> float:
 
 
 def quote(gear: list[dict], market: dict, cap: float) -> dict:
-    subtotal = 0.0
-    unknown = []
-    priced = []
-    for item in gear:
-        unique_listings = market.get("listings", {}).get(item["name"], []) if item["rarity"] == "unique" else []
-        if unique_listings:
-            variant = item.get("variant")
-            links = item.get("links")
-            compatible = [listing for listing in unique_listings
-                          if ((listing.get("variant") in {None, "Current"} if variant is None
-                               else listing.get("variant") == variant))
-                          and (links is None or listing.get("links") in {None, links})]
-            if not compatible:
-                unknown.append({"slot": item["slot"], "name": item["name"],
-                                "reason": "No quote matches the equipped unique variant and links"})
-                continue
-            value = min(float(listing["chaos"]) for listing in compatible)
-            subtotal += value
-            priced.append({"slot": item["slot"], "name": item["name"], "variant": variant,
-                           "links": links, "chaos": round(value, 1), "kind": "estimated"})
-        elif item["rarity"] == "unique" and market["prices"].get(item["name"]) and not market.get("listings"):
-            # Old snapshots lack per-variant/link detail. Do not combine them
-            # under one item name or treat their maximum as a compatible quote.
-            unknown.append({"slot": item["slot"], "name": item["name"],
-                            "reason": "Snapshot has no variant/link-specific unique quote"})
-        else:
-            display = item["base"] if item["rarity"] == "rare" else item["name"]
-            unknown.append({"slot": item["slot"], "name": display, "reason": "Rare/magic item needs a modifier-aware trade search" if item["rarity"] != "unique" else "Unique has no current-league quote"})
-    return {"pricedSubtotalChaos": round(subtotal, 1), "pricedSubtotalDivine": round(subtotal / market["divineChaos"], 2),
-            "unknown": unknown, "priced": priced, "complete": not unknown and not market["errors"],
-            "budgetChaos": cap, "budgetStatus": "priced subtotal exceeds budget" if subtotal > cap else
-            ("within budget" if not unknown and not market["errors"] else "unverified: unpriced slots remain"),
-            "source": market["source"], "updated": market["updated"], "league": market["league"],
-            "divineChaos": market["divineChaos"], "sourceErrors": market["errors"]}
+    """Unique-only price report (see ``unique_pricing.price_unique_equipment``).
+
+    A ``cap`` of 10,000,000 or more is the callers' "no budget stated" value.
+    Rares, magic items, gems and socket/link crafting are excluded scope, not
+    missing quotes; ``unknown`` lists only unquoted *uniques* with a reason.
+    """
+    budget = None if cap is None or cap >= 10_000_000 else cap
+    return price_unique_equipment(gear, market, budget)
 
 
 def generate(request: dict, app_root, data_root, stage) -> dict:

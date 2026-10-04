@@ -57,7 +57,8 @@ Granite Flask</Item><ItemSet id="1"><Slot name="Flask 2" itemId="1" active="fals
         phases = milestones(89)
         self.assertEqual(len(phases), 13)
         self.assertEqual(phases[-1]["title"], "Endgame - Level 89")
-        self.assertEqual(phases[-2]["links"], 5)
+        self.assertEqual(phases[-2]["links"], 6)  # Mapping is a real six-link
+        self.assertEqual(phases[-1]["links"], 6)
         self.assertEqual(phases[4]["ascendancyPoints"], 2)
         self.assertEqual(phases[7]["ascendancyPoints"], 4)
         self.assertEqual(phases[10]["ascendancyPoints"], 6)
@@ -151,7 +152,7 @@ Sockets: B</Item><ItemSet id="1"><Slot name="Body Armour" itemId="1"/></ItemSet>
         calc = {"calculated": True, "stats": {"Life": 4000, "CombinedDPS": 10, "Str": 100, "Dex": 100, "Int": 100,
                                              "FireResist": 75, "ColdResist": 75, "LightningResist": 75, "ManaUnreserved": 100},
                 "passives": {"used": 0, "ascendancy": 0}}
-        checks = stage_checks(xml, milestones(90)[-1], calc, data, {"tree": {"nodes": {"1": {"classStartIndex": 3}}}})
+        checks = stage_checks(xml, milestones(90)[3], calc, data, {"tree": {"nodes": {"1": {"classStartIndex": 3}}}})
         self.assertTrue(next(check["passed"] for check in checks if check["name"] == "Stage gem levels"))
         self.assertTrue(next(check["passed"] for check in checks if check["name"] == "Stage sockets"))
 
@@ -172,7 +173,7 @@ Sockets: B</Item><ItemSet id="1"><Slot name="Body Armour" itemId="1"/></ItemSet>
         calc = {"calculated": True, "stats": {"Life": 4000, "FullDPS": 10, "Str": 100, "Dex": 100,
                   "Int": 100, "FireResist": 75, "ColdResist": 75, "LightningResist": 75,
                   "ManaUnreserved": 100}, "passives": {"used": 0, "ascendancy": 0}}
-        checks = stage_checks(xml, milestones(90)[-1], calc, data,
+        checks = stage_checks(xml, milestones(90)[3], calc, data,
                               {"tree": {"nodes": {"1": {"classStartIndex": 3}}}})
         self.assertTrue(next(check["passed"] for check in checks if check["name"] == "Stage sockets"))
 

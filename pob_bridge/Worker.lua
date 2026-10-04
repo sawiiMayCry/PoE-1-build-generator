@@ -8,7 +8,19 @@ local statKeys = {"Life", "EnergyShield", "Armour", "Evasion", "FullDPS", "FullD
   "Omni", "ReqStr", "ReqDex", "ReqInt", "ReqOmni", "ExtraPoints", "Mana",
   "ManaUnreserved", "ManaUnreservedPercent", "LifeUnreserved", "LifeUnreservedPercent", "Duration",
   "TotalEHP", "ManaCost", "ManaRegen", "LifeCost", "LifeRegenRecovery",
-  "Speed", "HitChance", "ActiveMinionLimit"}
+  "Speed", "HitChance", "ActiveMinionLimit", "SummonedMinionsPerCast",
+  -- Defensive, recovery and resource channels (missing outputs stay unknown, never zero).
+  "PhysicalMaximumHitTaken", "FireMaximumHitTaken", "ColdMaximumHitTaken", "LightningMaximumHitTaken",
+  "ChaosMaximumHitTaken", "BlockChance", "SpellBlockChance", "SpellSuppressionChance",
+  "AttackDodgeChance", "SpellDodgeChance", "EnergyShieldRegen", "EnergyShieldRegenRecovery",
+  "EnergyShieldRecharge", "EnergyShieldRechargeDelay", "LifeRegen", "ManaRegenRecovery",
+  "LifeRecoverable", "LifeLeechRate", "ManaLeechRate", "EnergyShieldLeechRate",
+  "TotalDegen", "TotalNetRegen", "NetLifeRegen", "NetManaRegen", "NetEnergyShieldRegen",
+  "ManaReserved", "LifeReserved", "ManaCostRaw", "ManaPerSecondCost", "LifePerSecondCost",
+  "ChaosInoculation", "PowerCharges", "PowerChargesMax", "FrenzyCharges", "FrenzyChargesMax",
+  "EnduranceCharges", "EnduranceChargesMax", "ChaosResistOverCap", "FireResistOverCap",
+  "ColdResistOverCap", "LightningResistOverCap", "AreaOfEffectRadius", "CritChance",
+  "EffectiveMovementSpeedMod", "StunThreshold", "ProjectileCount"}
 
 local function stats(output)
   local result = {}
@@ -51,7 +63,23 @@ local function metadata()
           int = calcLib.getGemStatRequirement(effect.levelRequirement or 1, gem.grantedEffect.support, gem.reqInt or 0)}
       end
     end
-    gems[#gems + 1] = {id = id, gameId = gem.gameId, variantId = gem.variantId,
+    local skillTypes = {}
+    local effectData = gem.grantedEffect
+    if effectData and effectData.skillTypes then
+      for typeName, typeId in pairs(SkillType) do
+        if effectData.skillTypes[typeId] then skillTypes[#skillTypes + 1] = typeName end
+      end
+      table.sort(skillTypes)
+    end
+    local statIds = {}
+    if effectData then
+      for _, statId in ipairs(effectData.stats or {}) do statIds[#statIds + 1] = tostring(statId) end
+      for _, constant in ipairs(effectData.constantStats or {}) do statIds[#statIds + 1] = tostring(constant[1]) end
+    end
+    gems[#gems + 1] = {id = id, skillTypes = skillTypes, statIds = statIds,
+      legacy = (effectData and effectData.legacy) or false,
+      createsMinions = (effectData and effectData.minionList ~= nil) or false,
+      baseEffectiveness = effectData and effectData.baseEffectiveness or 0, gameId = gem.gameId, variantId = gem.variantId,
       name = gem.name, skillId = gem.grantedEffectId, tags = gem.tags,
       support = gem.grantedEffect and gem.grantedEffect.support or false,
       unsupported = gem.grantedEffect and gem.grantedEffect.unsupported or false,
@@ -164,7 +192,15 @@ local function handle(request)
       local effect = gem.grantedEffect
       if effect and effect.support and not effect.isTrigger
         and calcLib.canGrantedEffectSupportActiveSkill(effect, skill) then
-        result[#result + 1] = id
+        -- A support's requirements are matched against the gem's own skill types (as in game); PoB's
+        -- extra match against a summoned minion's skill types would pair e.g. attack-only supports
+        -- with spell summons.
+        local allowed = true
+        if skill.minionSkillTypes and not effect.ignoreMinionTypes and effect.requireSkillTypes
+          and effect.requireSkillTypes[1] then
+          allowed = calcLib.doesTypeExpressionMatch(effect.requireSkillTypes, skill.skillTypes)
+        end
+        if allowed then result[#result + 1] = id end
       end
     end
     return {supports = result}

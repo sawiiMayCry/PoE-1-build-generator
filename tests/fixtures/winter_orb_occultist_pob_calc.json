@@ -1,0 +1,44 @@
+{
+  "description": "Real PoB 2.67.2 outputs of a generated level-90 Winter Orb Occultist (non-published diagnostic)",
+  "pobVersion": "2.67.2",
+  "ascendancy": "Occultist",
+  "skill": "Winter Orb",
+  "stats": {
+    "FullDPS": 248321.3094,
+    "Speed": 7.72,
+    "Duration": 5.445,
+    "ManaCost": 9,
+    "ManaRegen": 26.1,
+    "Mana": 1148,
+    "ManaUnreserved": 172,
+    "ColdResist": 75,
+    "Life": 3772,
+    "EnergyShield": 3890,
+    "TotalEHP": 30747.446534925,
+    "ChaosResist": 24
+  },
+  "channelled": true,
+  "damageType": "cold",
+  "mechanicChecks": [
+    [
+      "Tested mechanic profile",
+      false
+    ],
+    [
+      "Main-skill damage calculated",
+      true
+    ],
+    [
+      "No unprotected 1-life character",
+      true
+    ],
+    [
+      "Mechanism-matched curse equipped",
+      true
+    ],
+    [
+      "Main-skill sustain leaves utility reserve",
+      true
+    ]
+  ]
+}

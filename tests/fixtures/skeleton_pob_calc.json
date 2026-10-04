@@ -1,0 +1,45 @@
+{
+  "description": "Real PoB 2.67.2 calculation of a generated level-90 Summon Skeletons Necromancer, main gem count set to 1, 4 and 8",
+  "pobVersion": "2.67.2",
+  "counts": {
+    "1": {
+      "FullDPS": 52088.191697297,
+      "TotalDPS": 0,
+      "CombinedDPS": 0,
+      "Speed": 2,
+      "Duration": 32.802,
+      "ActiveMinionLimit": 8,
+      "SummonedMinionsPerCast": 4,
+      "ManaCost": 46,
+      "ManaRegen": 35,
+      "ManaUnreserved": 976,
+      "Mana": 976
+    },
+    "4": {
+      "FullDPS": 208352.76678919,
+      "TotalDPS": 0,
+      "CombinedDPS": 0,
+      "Speed": 2,
+      "Duration": 32.802,
+      "ActiveMinionLimit": 8,
+      "SummonedMinionsPerCast": 4,
+      "ManaCost": 46,
+      "ManaRegen": 35,
+      "ManaUnreserved": 976,
+      "Mana": 976
+    },
+    "8": {
+      "FullDPS": 416705.53357837,
+      "TotalDPS": 0,
+      "CombinedDPS": 0,
+      "Speed": 2,
+      "Duration": 32.802,
+      "ActiveMinionLimit": 8,
+      "SummonedMinionsPerCast": 4,
+      "ManaCost": 46,
+      "ManaRegen": 35,
+      "ManaUnreserved": 976,
+      "Mana": 976
+    }
+  }
+}

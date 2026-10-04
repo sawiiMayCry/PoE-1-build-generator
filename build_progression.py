@@ -2,14 +2,29 @@
 from __future__ import annotations
 
 import copy
+import math
 from itertools import combinations
 import re
 import xml.etree.ElementTree as ET
 
-from build_assembly import assemble, disable_conditional_item_skill_groups
+from build_assembly import SocketConflict, assemble, disable_conditional_item_skill_groups
 from build_generator import _item_parts, _main_group, offense_value
 from generation_data import base_required_level, rare_templates, solve_suffixes
+from loadout_summary import active_spec, item_level_requirement, summarize_loadout
+from mechanics import retarget
 from passive_search import candidate_minion_count, graph, heuristic, paths_from
+from skill_packages import (apply_stage_caps, build_facts, capacity_from_equipment, fill_packages,
+                            groups_from_xml, make_group, pack_groups, package_group, trigger_level_legal)
+from unique_pricing import price_unique_equipment
+import unique_policy
+from unique_policy import worth_price
+
+
+def _gem_level(value) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return -1
 
 
 def mapping_unique_packages(options: list[tuple], spec: dict, data, level: int,
@@ -23,53 +38,61 @@ def mapping_unique_packages(options: list[tuple], spec: dict, data, level: int,
         if not definition or base_required_level(definition) > level:
             continue
         eligible.append(option[:4])
+    gains = spec.get("uniqueScreenGain") or {}
     terms = ("minion", "reservation", "spell", "life", "resistance", spec.get("damageType", ""))
     def rank(option):
         low = option[2].casefold()
-        return sum(term.casefold() in low for term in terms if term), option[0]
-    eligible.sort(key=lambda option: (-rank(option)[0], option[0], option[1]))
+        return (float(gains.get(option[0], 0.0)),
+                sum(term.casefold() in low for term in terms if term)), option[0]
+    eligible.sort(key=lambda option: (tuple(-value for value in rank(option)[0]), option[0], option[1]))
     required = set(spec.get("requestedUniques", ()))
+    cap = unique_policy.mapping_cap(spec)
+    stated = unique_policy.is_stated(spec)
     packages = []
     seen = set()
     def keep(package):
         names = {entry[0] for entry in package}
         if required and not required <= names:
             return
-        if spec.get("budgetChaos") is not None and (
-                any(entry[3] is None for entry in package) or
-                sum(entry[3] for entry in package) > spec["budgetChaos"]):
-            return
+        if cap is not None:
+            # A level-75 character owns a proportional share of the budget: the cheaper subset of what
+            # the final build equips.  Requested items always stay.
+            prices = [entry[3] for entry in package if entry[0] not in required]
+            if stated and (any(price is None for price in prices) or sum(prices) > cap + 1e-9):
+                return
+            if not stated and (unique_policy.package_total(spec, prices) > cap + 1e-9 or
+                               sum(price is None for price in prices) > unique_policy.MAX_UNPRICED_UNIQUES):
+                return
         if len({entry[1] for entry in package}) != len(package):
             return
         key = tuple(sorted((entry[0], entry[1]) for entry in package))
         if key not in seen:
             seen.add(key)
             packages.append(list(package))
+    def conflict(package):
+        for member in package:
+            if member[1] != "Weapon 1":
+                continue
+            base = data.bases.get(_item_parts(member[2])[2], {})
+            if base.get("tags", {}).get("two_hand_weapon") and any(other[1] == "Weapon 2" for other in package):
+                return True
+        return False
     single_limit = max(1, limit // 2)
     single_options = [option for option in eligible if option[0] in required]
     single_options.extend(option for option in eligible if option[0] not in required)
     for option in single_options[:single_limit]:
         keep([option])
-    pairs = []
-    for first, second in combinations(eligible, 2):
-        if first[1] == second[1]:
-            continue
-        names = {first[0], second[0]}
-        if required and not required <= names:
-            continue
-        try:
-            first_base = _item_parts(first[2])[2]
-            second_base = _item_parts(second[2])[2]
-        except ValueError:
-            continue
-        if ((first[1] == "Weapon 1" and data.bases.get(first_base, {}).get("tags", {}).get("two_hand_weapon") and
-             second[1] == "Weapon 2") or
-            (second[1] == "Weapon 1" and data.bases.get(second_base, {}).get("tags", {}).get("two_hand_weapon") and
-             first[1] == "Weapon 2")):
-            continue
-        relevance = rank(first)[0] + rank(second)[0]
-        pairs.append((-relevance, tuple(sorted(names)), (first, second)))
-    for _, _, package in sorted(pairs):
+    candidates = []
+    for size in (2, 3):
+        for package in combinations(eligible[:12], size):
+            names = {entry[0] for entry in package}
+            if required and not required <= names:
+                continue
+            if conflict(package):
+                continue
+            relevance = tuple(sum(rank(entry)[0][index] for entry in package) for index in (0, 1))
+            candidates.append((tuple(-value for value in relevance), tuple(sorted(names)), package))
+    for _, _, package in sorted(candidates):
         keep(package)
         if len(packages) >= limit:
             break
@@ -93,7 +116,7 @@ def milestones(end_level: int) -> list[dict]:
                        "resistanceTarget": 45 if act == 1 else 60 if act == 2 else 75})
     result.extend([
         {"title": "Mapping - Level 75", "level": 75, "act": 11, "questPoints": 24,
-         "ascendancyPoints": 6, "links": 5, "resistancePenalty": -60, "resistanceTarget": 75},
+         "ascendancyPoints": 6, "links": 6, "resistancePenalty": -60, "resistanceTarget": 75},
         {"title": f"Endgame - Level {end_level}", "level": end_level, "act": 12, "questPoints": 24,
          "ascendancyPoints": 8, "links": 6, "resistancePenalty": -60, "resistanceTarget": 75}])
     return result
@@ -293,7 +316,7 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
     active_skill_set = skill_container.get("activeSkillSet") if skill_container is not None else None
     active_skills = next((entry for entry in root.findall("./Skills/SkillSet")
                           if entry.get("id") == active_skill_set), None)
-    valid_gems = all(any(entry["level"] == int(gem.get("level")) and entry["requiredLevel"] <= phase["level"]
+    valid_gems = all(any(entry["level"] == _gem_level(gem.get("level")) and entry["requiredLevel"] <= phase["level"]
                          for entry in data.gem(gem.get("nameSpec"))["levels"])
                      for gem in (active_skills.findall("./Skill/Gem") if active_skills is not None else [])
                      if gem.get("gemId"))
@@ -310,24 +333,18 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
                 valid_items = False
             continue
         _, _, base = _item_parts(item.text)
-        valid_items = valid_items and base in data.bases and base_required_level(data.bases[base]) <= phase["level"]
+        valid_items = (valid_items and base in data.bases and base_required_level(data.bases[base]) <= phase["level"]
+                       and item_level_requirement(item.text) <= phase["level"])
     complete_flasks = flasks_complete(xml, data, phase["level"])
     _, main, _ = _main_group(root)
-    links = len(main.findall("Gem"))
-    counts = {}
-    for group in active_skills.findall("Skill") if active_skills is not None else []:
-        socketed = sum(bool(gem.get("gemId")) for gem in group.findall("Gem"))
-        if socketed:
-            counts[group.get("slot")] = counts.get(group.get("slot"), 0) + socketed
-    def socket_count(slot):
-        entry = next((entry for entry in equipment.findall("Slot") if entry.get("name") == slot), None)
-        if entry is None or entry.get("itemId") not in ids:
-            return 0
-        text = ids[entry.get("itemId")].text
-        match = re.search(r"(?m)^Sockets: ([RGBW -]+)$", text)
-        return sum(color in "RGBW" for color in match[1]) if match else 0
-    available_sockets = {slot: socket_count(slot) for slot in counts}
-    socket_ok = links <= phase["links"] and all(count <= available_sockets[slot] for slot, count in counts.items())
+    links = sum(1 for gem in main.findall("Gem") if gem.get("gemId"))
+    loadout = summarize_loadout(root, data.gems)
+    # Mapping and Endgame must carry the complete six-link; leveling stages may be shorter.
+    exact = phase.get("act", 0) >= 11
+    link_ok = links == phase["links"] if exact else links <= phase["links"]
+    placed = not loadout["unplacedGroups"]
+    socket_ok = link_ok and placed
+    spare = {slot: entry["socketsSpare"] for slot, entry in loadout["bySlot"].items() if entry["socketTotal"]}
     connected = True
     official = context["tree"]["nodes"]
     for ascendancy in (False, True):
@@ -352,8 +369,10 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
         ("Stage equipment levels", valid_items),
         ("Five equipped flasks", complete_flasks, "Each active stage must resolve five level-legal flask items"),
         ("Stage sockets", socket_ok,
-         f"{phase['title']}; main link {links}/{phase['links']}; groups {counts}; "
-         f"available sockets {available_sockets}"),
+         f"{phase['title']}; main link {links}/{phase['links']}"
+         f"{' (exactly required)' if exact else ''}; {loadout['socketedGemCount']} socketed gems in "
+         f"{loadout['socketedGroupCount']} groups; unplaced groups {loadout['unplacedGroups']}; "
+         f"spare sockets {spare}"),
         ("Stage attributes", all(output.get(attr, 0) >= output.get("Req" + attr, 0) for attr in ("Str", "Dex", "Int"))),
         ("Stage resistances", all(output.get(element + "Resist", -60) >= phase["resistanceTarget"] for element in ("Fire", "Cold", "Lightning"))),
         ("Stage mana", output.get("ManaUnreserved", 0) >= output.get("ManaCost", 0)),
@@ -363,6 +382,14 @@ def stage_checks(xml: str, phase: dict, calc: dict, data, context) -> list[dict]
     ]
     return [{"name": fact[0], "passed": bool(fact[1]),
              "reason": fact[2] if len(fact) > 2 else phase["title"]} for fact in facts]
+
+
+def _waive_mana(checks: list[dict], warning: str | None) -> list[dict]:
+    """Turn the Stage mana failure of a degraded Mapping stage into a visible warning."""
+    if not warning:
+        return checks
+    return [{**check, "passed": True, "warning": True, "reason": warning} if check["name"] == "Stage mana" else check
+            for check in checks]
 
 
 def build_notes(spec: dict, stages: list[dict]) -> str:
@@ -396,7 +423,15 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
         previous = phase["mainSkill"]
         lines.extend(phase["instructions"])
         lines.append("Gems: " + "; ".join(f"{name} level {level}" for name, level in phase["gemLevels"].items()))
-        lines.append("Equipment: " + "; ".join(f"{item['slot']}: {item['base']}" for item in phase["gear"]))
+        lines.append("Equipment: " + "; ".join(
+            (f"{item['slot']}: {item['name']} ({item['base']})" if item.get("isUnique") else
+             f"{item['slot']}: {item['base']}") for item in phase["gear"]))
+        for group in phase.get("skillGroups", []):
+            lines.append(f"Skill group {group['index']} ({group['slot']}): " + " + ".join(
+                f"{gem['name']} {gem['level']}" for gem in group["gems"]))
+        if phase.get("jewels"):
+            lines.append("Jewels: " + "; ".join(
+                f"node {jewel['node']}: {jewel['name']} ({jewel['base']})" for jewel in phase["jewels"]))
         if phase.get("act") == 11:
             if phase.get("uniquePackageCostChaos") is None:
                 lines.append("Mapping package price is unknown or no priced unique package was selected; rare equipment remains unpriced.")
@@ -415,10 +450,225 @@ def build_notes(spec: dict, stages: list[dict]) -> str:
     return "\n".join(lines)
 
 
+EARLY_UTILITY = {"Flame Dash", "Steelskin"}
+RESERVING_ROLES = {"aura", "defense", "herald"}
+
+
+def stage_utility_cap(level: int) -> int:
+    return 1 if level == 1 else 3 if level < 25 else 4
+
+
+def _ci_nodes(official: dict, nodes: set[str]) -> set[str]:
+    return {key for key in nodes if official.get(key, {}).get("name") == "Chaos Inoculation"}
+
+
+def _fill_stage_supports(worker, render, groups, data, level, need, compatible, spec, cap):
+    """Complete a main link from level-legal compatible supports (best measured first)."""
+    main = groups[0]
+    chosen = {gem["name"] for gem in main["gems"]}
+    for _ in range(need):
+        names = [name for name, gem in data.gems.items()
+                 if gem.get("support") and gem["id"] in compatible and name not in chosen
+                 and not name.startswith("Awakened ") and not gem.get("tags", {}).get("exceptional")
+                 and gem.get("maxLevel", 20) >= 20 and gem_level(gem, level)
+                 and name not in {"Sacrifice", "Vaal Sacrifice", "Cast on Death"}]
+        names = sorted(names)[:40]
+        if not names:
+            break
+        xml = render(groups)
+        base = offense_value(worker.request("calculate", xml=xml)["stats"])
+        scored = []
+        for offset in range(0, len(names), 20):
+            batch = names[offset:offset + 20]
+            scored.extend(worker.request("supportScores", xml=xml,
+                                         candidates=[data.gem(name)["id"] for name in batch])["candidates"])
+        if not scored:
+            break
+        best = max(scored, key=lambda row: (offense_value(row["stats"]), row["id"]))
+        if offense_value(best["stats"]) <= base * 1.001:
+            break
+        name = data.by_id[best["id"]]["name"]
+        chosen.add(name)
+        main["gems"].append({"instance": f"main:{len(main['gems']) + 1}", "name": name, "kind": "support",
+                             "level": gem_level(data.gem(name), level, cap), "quality": 0,
+                             "enabled": True, "count": 1})
+    return groups
+
+
+def _stage_main_group(spec, data, phase, main_skill, pool, compatible, cap):
+    early = ["Minion Damage", "Added Lightning Damage", "Added Cold Damage", "Arcane Surge", "Combustion",
+             "Lesser Multiple Projectiles"]
+    names = [name for name in dict.fromkeys([*pool, *early]) if name in data.gems
+             and data.gem(name)["id"] in compatible and gem_level(data.gem(name), phase["level"])
+             and (phase["act"] >= 3 or name in early)][:phase["links"] - 1]
+    gems = [(main_skill, "active"), *[(name, "support") for name in names]]
+    return make_group("main", "main", gems, slot="Body Armour", main_active=main_skill,
+                      include_in_full_dps=True,
+                      level_for=lambda name: gem_level(data.gem(name), phase["level"], cap),
+                      justification="Stage main link")
+
+
+def _stage_utility_groups(spec, data, phase, final_groups, cap, capacity, groups, notes):
+    """Add the endgame utility packages that are level-legal and fit this stage's sockets."""
+    level = phase["level"]
+    for source in final_groups:
+        if source["role"] == "main":
+            continue
+        gems = []
+        for gem in source["gems"]:
+            name = gem["name"]
+            if name not in data.gems:
+                continue
+            if phase["act"] < 3 and (gem["kind"] == "support" or name not in EARLY_UTILITY):
+                continue
+            if phase["act"] < 11 and data.gem(name).get("tags", {}).get("exceptional"):
+                continue   # exceptional gems are endgame acquisitions, not campaign gems
+            usable = gem_level(data.gem(name), level, min(cap, 10) if name == "Steelskin" else cap)
+            if usable:
+                gems.append({**gem, "level": usable, "instance": gem["instance"]})
+        label = ", ".join(gem["name"] for gem in source["gems"])
+        if not any(gem["kind"] == "active" for gem in gems):
+            if phase["act"] >= 3:
+                notes.append(f"Add the {source['role']} package ({label}) once its gems unlock.")
+            continue
+        group = {**source, "gems": gems, "slot": None,
+                 "mainActive": next(gem["name"] for gem in gems if gem["kind"] == "active")}
+        trigger = next((gem for gem in gems if gem["name"] == "Cast when Damage Taken"), None)
+        if trigger is not None:
+            triggered = next(gem for gem in gems if gem["kind"] == "active")
+            ok, why = trigger_level_legal(data, trigger["name"], trigger["level"], triggered["name"],
+                                          triggered["level"])
+            if not ok:
+                group["gems"] = [gem for gem in gems if gem is not trigger]
+                group["delivery"] = "manual"
+                notes.append(f"Cast the {triggered['name']} manually at this stage: {why}.")
+        trial = [*groups, group]
+        if pack_groups(trial, capacity)["unplaced"]:
+            notes.append(f"Add the {source['role']} package ({label}) when you have enough linked sockets.")
+            continue
+        groups.append(group)
+    return groups
+
+
+def _stage_fill_spare(spec, phase_spec, data, phase, items, capacity, groups, notes, stats=None):
+    """Give every spare socket of this stage's gear a level-legal, role-justified gem group.
+
+    Same catalogue and ordering as the endgame fill (no PoB-measured packages, no reservations), so a
+    stage never lists an unexplained empty socket; one movement skill at most.
+    """
+    if phase["level"] < 12:
+        return groups
+    facts = build_facts(phase_spec, items, {}, data)
+    facts["level"] = phase["level"]
+    present = {gem["name"] for group in groups for gem in group["gems"] if gem["kind"] == "active"}
+    roles = {group["role"] for group in groups}
+    for pkg in fill_packages(phase_spec, data, facts, present, roles=roles):
+        if str(pkg["evidence"]).startswith("stat"):
+            continue
+        if pkg["role"] == "movement" and "movement" in roles:
+            continue
+        if any(name in present for name, _ in pkg["gems"][:1]):
+            continue
+        packing = pack_groups(groups, capacity)
+        used = {slot: 0 for slot in capacity}
+        for group in groups:
+            slot = packing["placements"].get(group["id"])
+            if slot in used:
+                used[slot] += len(group["gems"])
+        largest = max((info["total"] - used[slot] for slot, info in capacity.items()), default=0)
+        if largest <= 0:
+            break
+        trimmed = {**pkg, "gems": pkg["gems"][:largest]}
+        group = package_group(trimmed, data, phase["level"])
+        if any(not gem["level"] for gem in group["gems"]):
+            continue
+        if stats:
+            # Gems whose attribute requirements the stage's character cannot meet are not placed.
+            from skill_planner import fit_levels_to_attributes
+            known = {gem["instance"] for g in groups for gem in g["gems"]}
+            if fit_levels_to_attributes([*groups, group], known, stats, data):
+                continue
+        if pack_groups([*groups, group], capacity)["unplaced"]:
+            continue
+        groups = [*groups, group]
+        present.add(pkg["gems"][0][0])
+        roles.add(pkg["role"])
+    packing = pack_groups(groups, capacity)
+    used = {slot: 0 for slot in capacity}
+    for group in groups:
+        slot = packing["placements"].get(group["id"])
+        if slot in used:
+            used[slot] += len(group["gems"])
+    open_sockets = {slot: info["total"] - used[slot] for slot, info in capacity.items()
+                    if info["total"] - used[slot] > 0 and slot != "Body Armour"}
+    if open_sockets:
+        notes.append("Sockets left open at this stage (no further level-legal gem with a stated role is "
+                     "available yet): " + ", ".join(f"{slot} x{count}" for slot, count in sorted(open_sockets.items()))
+                     + ".")
+    return groups
+
+
+def _drop_last_reserver(groups: list[dict]) -> str | None:
+    for group in reversed(groups):
+        if group["role"] not in RESERVING_ROLES:
+            continue
+        actives = [gem for gem in group["gems"] if gem["kind"] == "active"]
+        if len(actives) > 1:
+            removed = actives[-1]
+            group["gems"].remove(removed)
+            if group.get("mainActive") == removed["name"]:
+                group["mainActive"] = actives[0]["name"]
+            return removed["name"]
+        groups.remove(group)
+        return actives[0]["name"] if actives else group["id"]
+    return None
+
+
+def _stage_jewels(root, selected: set[str], level: int, data) -> dict[str, str]:
+    """Endgame jewels whose sockets are allocated by this stage and whose requirements are met."""
+    spec_node = active_spec(root)
+    if spec_node is None:
+        return {}
+    items = {item.get("id"): item.text for item in root.findall("./Items/Item")}
+    result = {}
+    for socket in spec_node.findall("./Sockets/Socket"):
+        text = items.get(socket.get("itemId"))
+        if not text or socket.get("nodeId") not in selected:
+            continue
+        _, _, base = _item_parts(text)
+        definition = data.bases.get(base, {})
+        required = max(base_required_level(definition) if definition else 1, item_level_requirement(text))
+        if required <= level:
+            result[socket.get("nodeId")] = text.strip("\n\t ")
+    return result
+
+
+def _gear_rows(summary: dict) -> list[dict]:
+    return [{"slot": row["slot"], "name": row["name"], "rarity": row["rarity"], "base": row["base"],
+             "isUnique": row["isUnique"], "variant": row["variant"], "links": row["links"],
+             "sockets": row["sockets"], "corrupted": row["corrupted"]} for row in summary["gear"]]
+
+
+def _stage_loadout_fields(summary: dict) -> dict:
+    return {"skillGroups": [{"index": group["index"], "slot": group["slot"], "label": group["label"],
+                             "isMain": group["isMain"], "mainActive": group["mainActive"],
+                             "gems": [{key: gem[key] for key in ("name", "kind", "level", "quality", "enabled")}
+                                      for gem in group["gems"] if gem["socketed"]]}
+                            for group in summary["groups"] if not group["itemGranted"] and group["socketedGemCount"]],
+            "socketedGemCount": summary["socketedGemCount"],
+            "supportedGroupCount": summary["supportedGroupCount"],
+            "itemGranted": summary["itemGranted"],
+            "jewels": [{key: jewel[key] for key in ("node", "name", "base", "rarity", "isUnique")}
+                       for jewel in summary["jewels"]],
+            "slotLinks": {slot: {"linkedRuns": entry["linkedRuns"], "used": entry["socketsUsed"],
+                                 "spare": entry["socketsSpare"]}
+                          for slot, entry in summary["bySlot"].items() if entry["socketTotal"]}}
+
+
 def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, stage,
-                    unique_candidates: list[tuple] | None = None):
+                    unique_candidates: list[tuple] | None = None, market: dict | None = None):
     root = ET.fromstring(endgame_xml)
-    final_spec = root.find("./Tree/Spec")
+    final_spec = active_spec(root)
     official = context["tree"]["nodes"]
     final_nodes = set(final_spec.get("nodes").split(","))
     masteries = {key: int(effect) for key, effect in re.findall(r"\{(\d+),(\d+)\}", final_spec.get("masteryEffects", ""))}
@@ -430,84 +680,126 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
     # resistance nodes. Keep the exact final allocation, but order its legal
     # prefix defensively so the level-75 and act loadouts remain survivable.
     progression_spec = {**spec, "focus": "defense"}
-    order = connected_order(official, regular, start, progression_spec, masteries)
+    # Chaos Inoculation must not appear in a stage prefix merely because the
+    # keystone is on the final tree; stages stay life-based until the Endgame
+    # respec (gear, recovery and the keystone are all required together).
+    ci = _ci_nodes(official, regular) if spec.get("defenseModel") == "ci" else set()
+    try:
+        order = connected_order(official, regular - ci, start, progression_spec, masteries)
+        ci_deferred = bool(ci)
+    except ValueError:
+        order, ci_deferred = connected_order(official, regular, start, progression_spec, masteries), False
     asc_order = ascendancy_order(official, asc, asc_start, spec)
-    final_supports = [gem.get("nameSpec") for gem in _main_group(root)[1].findall("Gem")][1:]
+    final_summary = summarize_loadout(root, data.gems)
+    final_groups = [group for group in groups_from_xml(root, data)]
+    final_main = next(group for group in final_groups if group["role"] == "main")
+    final_supports = [gem["name"] for gem in final_main["gems"] if gem["kind"] == "support"]
+    mapping_pool = list((spec.get("mappingSupportPlan") or {}).get("mappingLink") or final_supports)
     phases, documents, summaries = milestones(spec["level"]), [], []
     previous_skill, previous_ascendancy = None, 0
     unique_candidates = unique_candidates or []
+    budget_cap = spec.get("budgetChaos")
     for phase in phases:
         stage("Generating and validating " + phase["title"])
         instructions = []
+        notes_for_stage: list[str] = []
+        mana_warning = None
         if phase["act"] == 12:
             document = copy.deepcopy(root)
             add_flasks(document, data, phase["level"])
             xml = ET.tostring(document, encoding="unicode")
             calc = worker.request("calculate", xml=xml)
             main_skill = spec["skill"]
-            gem_levels = {gem.get("nameSpec"): int(gem.get("level")) for gem in document.findall("./Skills/SkillSet/Skill/Gem")
-                          if gem.get("gemId")}
-            supports = final_supports
             stage_uniques = {}
             mapping_package_price = 0
+            if ci_deferred:
+                instructions.append(
+                    "RESPEC TO CHAOS INOCULATION: earlier stages stay life-based. Before taking Chaos "
+                    "Inoculation, have the energy-shield gear, recovery and defenses of this stage; allocate the "
+                    "keystone with the remaining points and refund the life nodes it replaces.")
         else:
             main_skill = stage_skill(spec, data, phase)
-            phase_spec = {**spec, "skill": main_skill, "level": phase["level"], "minionCount": 1,
+            cap = 19 if phase["act"] == 11 else 20
+            phase_spec = {**retarget(spec, main_skill, data.gem(main_skill)["tags"]),
+                          "level": phase["level"], "minionCount": 1,
                           "ascendancy": spec["ascendancy"] if phase["ascendancyPoints"] else "None",
-                          "mainLinks": phase["links"], "utilitySockets": 1 if phase["level"] == 1 else 3 if phase["level"] < 25 else 4,
-                          "enemyLevel": phase["level"], "resistancePenalty": phase["resistancePenalty"]}
-            phase_spec["utility"] = {name: slot for name, slot in spec["utility"].items()
-                                     if gem_level(data.gem(name), phase["level"])
-                                     and (phase["act"] >= 3 or name in {"Flame Dash", "Steelskin"})}
-            if phase["level"] == 1:
-                phase_spec["utility"] = {}
-            gem_levels = {name: gem_level(data.gem(name), phase["level"], 19 if phase["act"] == 11 else 20)
-                          for name in [main_skill, *phase_spec["utility"]]}
-            phase_spec["gemLevels"] = gem_levels
+                          "mainLinks": phase["links"], "utilitySockets": stage_utility_cap(phase["level"]),
+                          "enemyLevel": phase["level"], "resistancePenalty": phase["resistancePenalty"],
+                          "defenseModel": "hybrid", "skillGroups": None}
             selected = set(order[:phase["level"] + phase["questPoints"]])
             if phase["ascendancyPoints"]:
                 selected.update(asc_order[:phase["ascendancyPoints"] + 1])
             effects = {key: value for key, value in masteries.items() if key in selected}
             # A temporary attack skill may need a different weapon than the
             # requested final attack. Spell/minion starters can use the same type.
-            items = rare_templates(data, spec["archetype"], spec["weaponType"], character_level=phase["level"])
-            supports = []
+            items = rare_templates(data, spec["archetype"], spec["weaponType"], character_level=phase["level"],
+                                   defense_model="hybrid")
             stage_uniques = {}
             mapping_package_price = 0
-            def render():
-                return assemble(phase_spec, context, data, selected, supports, items, effects, stage_uniques)
-            xml = render()
-            compatible = set(worker.request("supports", xml=xml)["supports"])
-            early = ["Minion Damage", "Added Lightning Damage", "Added Cold Damage", "Arcane Surge", "Combustion", "Lesser Multiple Projectiles"]
-            available = [name for name in dict.fromkeys([*final_supports, *early]) if name in data.gems
-                         and data.gem(name)["id"] in compatible and gem_level(data.gem(name), phase["level"])
-                         and (phase["act"] >= 3 or name in early)]
-            for name in available[:phase["links"] - 1]:
-                supports.append(name)
-                gem_levels[name] = gem_level(data.gem(name), phase["level"], 19 if phase["act"] == 11 else 20)
-            for attempt in range(5):
+            stage_jewels = _stage_jewels(root, selected, phase["level"], data) if phase["act"] == 11 else {}
+            groups: list[dict] = []
+            stage_fill_notes: list[str] = []
+
+            def render(skill_groups=None, jewels=None):
+                return assemble(phase_spec, context, data, selected, [], items, effects, stage_uniques,
+                                stage_jewels if jewels is None else jewels,
+                                skill_groups=groups if skill_groups is None else skill_groups)
+
+            # Chaos resistance is repaired from the Merciless Kitava penalty onward (never under CI).
+            stage_chaos_target = 0 if phase["act"] >= 10 and spec.get("defenseModel") != "ci" else None
+            capacity = apply_stage_caps(capacity_from_equipment(items, {}, data), phase_spec["utilitySockets"],
+                                        phase["links"])
+            pool = mapping_pool if phase["act"] == 11 else final_supports
+            probe_main = make_group("main", "main", [(main_skill, "active")], slot="Body Armour",
+                                    main_active=main_skill, include_in_full_dps=True,
+                                    level_for=lambda name: gem_level(data.gem(name), phase["level"], cap))
+            compatible = set(worker.request("supports", xml=render([probe_main], {}))["supports"])
+            groups = [_stage_main_group(spec, data, phase, main_skill, pool, compatible, cap)]
+            if phase["act"] >= 11 and len(groups[0]["gems"]) < phase["links"]:
+                groups = _fill_stage_supports(worker, render, groups, data, phase["level"],
+                                              phase["links"] - len(groups[0]["gems"]), compatible, spec, cap)
+            groups = _stage_utility_groups(spec, data, phase, final_groups, cap, capacity, groups, notes_for_stage)
+            if phase["level"] == 1:
+                groups = groups[:1]
+            else:
+                stage_fill_notes.clear()
+                groups = _stage_fill_spare(spec, phase_spec, data, phase, items, capacity, groups, stage_fill_notes,
+                                           stats=worker.request("calculate", xml=render())["stats"])
+            for attempt in range(12):    # one step per dropped reserver / fixed deficit
                 calc = worker.request("calculate", xml=render())
                 estimated_population = candidate_minion_count(calc["stats"], phase_spec)
                 if (estimated_population is not None and
                         estimated_population != phase_spec.get("minionCount")):
                     phase_spec["minionCount"] = estimated_population
                     continue
-                if solve_suffixes(items, data, calc["stats"], resistance_target=phase["resistanceTarget"]):
+                if solve_suffixes(items, data, calc["stats"], resistance_target=phase["resistanceTarget"],
+                                  chaos_target=stage_chaos_target):
                     continue
                 if calc["stats"].get("ManaUnreserved", 0) < calc["stats"].get("ManaCost", 0):
-                    auras = [name for name in phase_spec["utility"] if data.gem(name)["tags"].get("aura")]
-                    if auras:
-                        removed = auras[-1]
-                        del phase_spec["utility"][removed]
-                        gem_levels.pop(removed, None)
+                    removed = _drop_last_reserver(groups)
+                    if removed:
                         instructions.append(f"Add {removed} later, once reservation leaves enough mana for your main skill.")
                         continue
-                    if supports:
-                        gem_levels.pop(supports.pop(), None)
+                    if phase["act"] >= 11:
+                        # Degraded stage, not a failed generation: keep the complete link and
+                        # report the mana shortfall so the player knows what to repair.
+                        mana_warning = (
+                            f"WARNING: {phase['title']} cannot fully sustain its {phase['links']}-link: "
+                            f"mana cost {calc['stats'].get('ManaCost', 0):.0f} exceeds unreserved mana "
+                            f"{calc['stats'].get('ManaUnreserved', 0):.0f} even with no optional reservations. "
+                            "Use mana flasks, leech or more mana until the gear is repaired.")
+                        instructions.append(mana_warning)
+                        break
+                    # Campaign stages may take links gradually.
+                    main_group = groups[0]
+                    supports_here = [gem for gem in main_group["gems"] if gem["kind"] == "support"]
+                    if supports_here:
+                        main_group["gems"].remove(supports_here[-1])
                         continue
                 break
             if phase["act"] == 11 and unique_candidates:
                 best_score = offense_value(calc["stats"])
+                best_base = best_score
                 mapping_target = None
                 for package in mapping_unique_packages(unique_candidates, spec, data, phase["level"]):
                     package_items = copy.deepcopy(items)
@@ -516,15 +808,19 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
                         if item.slot in package_uniques:
                             item.mods.clear()
                     def package_xml():
-                        return assemble(phase_spec, context, data, selected, supports, package_items,
-                                        effects, package_uniques)
-                    candidate_xml = ET.fromstring(package_xml())
+                        return assemble(phase_spec, context, data, selected, [], package_items,
+                                        effects, package_uniques, stage_jewels, skill_groups=groups)
+                    try:
+                        candidate_xml = ET.fromstring(package_xml())
+                    except SocketConflict:
+                        continue
                     add_flasks(candidate_xml, data, phase["level"])
                     trial_xml = ET.tostring(candidate_xml, encoding="unicode")
                     trial_calc = worker.request("calculate", xml=trial_xml)
                     for _ in range(3):
                         if not solve_suffixes(package_items, data, trial_calc["stats"],
-                                              resistance_target=phase["resistanceTarget"]):
+                                              resistance_target=phase["resistanceTarget"],
+                                              chaos_target=stage_chaos_target):
                             break
                         candidate_xml = ET.fromstring(package_xml())
                         add_flasks(candidate_xml, data, phase["level"])
@@ -532,20 +828,42 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
                         trial_calc = worker.request("calculate", xml=trial_xml)
                     trial_checks = stage_checks(trial_xml, phase, trial_calc, data, context)
                     trial_score = offense_value(trial_calc["stats"])
-                    if all(check["passed"] for check in trial_checks) and trial_score > best_score + 0.001:
+                    package_cost = [entry[3] for entry in package if entry[0] not in spec.get("requestedUniques", ())]
+                    gain = math.log(trial_score / best_base) if best_base > 0 and trial_score > 0 else 0.0
+                    if (all(check["passed"] for check in trial_checks) and trial_score > best_score + 0.001
+                            and worth_price(spec, gain, package_cost)):
                         best_score = trial_score
                         package_price = (None if any(entry[3] is None for entry in package) else
                                          sum(entry[3] for entry in package))
                         mapping_target = (package_items, package_uniques, trial_calc, package_price)
                 if mapping_target:
+                    pre_package = (items, stage_uniques, calc, mapping_package_price, copy.deepcopy(groups),
+                                   list(stage_fill_notes))
                     items, stage_uniques, calc, mapping_package_price = mapping_target
+                    # The package may bring sockets of its own (fixed-socket uniques): fill them too.
+                    capacity = apply_stage_caps(capacity_from_equipment(items, stage_uniques, data),
+                                                phase_spec["utilitySockets"], phase["links"])
+                    stage_fill_notes.clear()
+                    groups = _stage_fill_spare(spec, phase_spec, data, phase, items, capacity, groups,
+                                               stage_fill_notes, stats=calc["stats"])
                     names = [_item_parts(text)[1] for text in stage_uniques.values()]
                     instructions.append("Mapping equipment target: " + ", ".join(names) +
                                         ("; package selected from level-legal PoB comparisons within the stated budget."
                                          if spec.get("budgetChaos") is not None else
-                                         "; package selected from level-legal PoB comparisons; no budget cap was stated."))
-                elif spec.get("budgetChaos") is not None:
-                    instructions.append("Mapping kept its all-rare equipment target; no tested level-legal unique package improved the PoB result within budget.")
+                                         f"; level-legal subset of the final build's uniques, limited to "
+                                         f"{unique_policy.MAPPING_BUDGET_SHARE * 100:.0f}% of the standard unique budget "
+                                         f"({unique_policy.mapping_cap(spec) or 0:g} chaos)."))
+                    try:
+                        render()
+                    except SocketConflict:
+                        # The package's sockets cannot hold this stage's gem groups: keep the all-rare target.
+                        items, stage_uniques, calc, mapping_package_price, groups, saved_notes = pre_package
+                        stage_fill_notes[:] = saved_notes
+                        instructions.pop()
+                        instructions.append("Mapping kept its all-rare equipment target; the best unique package "
+                                            "did not leave enough sockets for the stage's gem groups.")
+                elif unique_candidates:
+                    instructions.append("Mapping kept its all-rare equipment target; no tested level-legal unique package improved the PoB result within the Mapping budget.")
             document = ET.fromstring(render())
             add_flasks(document, data, phase["level"])
             xml = ET.tostring(document, encoding="unicode")
@@ -559,11 +877,19 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
                         raise ValueError("Illegal leveling affix on " + item.slot)
                     probe.mods.append(mod)
             if phase["act"] == 11:
-                instructions.append("Begin with white maps, then yellow maps as damage and survival allow; upgrade to a six-link for Endgame.")
-        checks = stage_checks(xml, phase, calc, data, context)
+                instructions.append("Begin with white maps, then yellow maps as damage and survival allow. "
+                                    "Mapping assumes a six-linked body armour; socket and link crafting is not priced.")
+                if stage_jewels:
+                    instructions.append("Socket jewels: " + "; ".join(
+                        f"node {node}: {_item_parts(text)[1]}" for node, text in sorted(stage_jewels.items(),
+                                                                                      key=lambda row: int(row[0]))) + ".")
+            instructions.extend(notes_for_stage)
+            instructions.extend(stage_fill_notes)
+        checks = _waive_mana(stage_checks(xml, phase, calc, data, context), mana_warning)
         failures = [check["name"] for check in checks if not check["passed"]]
         if failures:
-            raise ValueError(phase["title"] + " failed validation: " + ", ".join(failures))
+            raise ValueError(phase["title"] + " failed validation: " + ", ".join(
+                f"{check['name']}: {check['reason']}" for check in checks if not check["passed"]))
         if main_skill != previous_skill:
             unlock = min(entry["requiredLevel"] for entry in data.gem(main_skill)["levels"])
             instructions.append(f"{main_skill} unlocks at character level {unlock}. Obtain the gem before switching; normal off-class gems can be bought from Siosa after the Act 3 Library quest.")
@@ -573,7 +899,6 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             names = [official[key]["name"] for key in asc_order[previous_ascendancy + 1:phase["ascendancyPoints"] + 1]
                      if official[key].get("isNotable")]
             instructions.append("Complete the next Labyrinth and allocate: " + ", ".join(names) + ".")
-        instructions.append(f"Use the shown {len(supports) + 1}-gem main link; keep enough free mana to use {main_skill}. Upgrade your mana flask as needed.")
         if phase["act"] in {5, 10}:
             instructions.append(f"This checkpoint includes Kitava's {phase['resistancePenalty']}% total resistance penalty; repair gear to reach 75% fire, cold and lightning resistance.")
         previous_skill, previous_ascendancy = main_skill, phase["ascendancyPoints"]
@@ -588,27 +913,12 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
         # PoB's first save materializes default combat placeholders. Score and
         # summarize the saved stage that will actually be merged/shared.
         calc = worker.request("calculate", xml=export["xml"])
-        checks = stage_checks(export["xml"], phase, calc, data, context)
+        checks = _waive_mana(stage_checks(export["xml"], phase, calc, data, context), mana_warning)
         failures = [check["name"] for check in checks if not check["passed"]]
         if failures:
             raise ValueError(phase["title"] + " failed saved-export validation: " + ", ".join(failures))
-        gear = []
-        for item in document.findall("./Items/Item"):
-                rarity, name, base = _item_parts(item.text)
-                item_slots = [slot.get("name") for slot in document.findall("./Items/ItemSet/Slot") if slot.get("itemId") == item.get("id")]
-                for slot in item_slots:
-                    gear.append({"slot": slot, "name": name, "rarity": rarity, "base": base})
-        actual_levels = {gem.get("nameSpec"): int(gem.get("level")) for gem in document.findall("./Skills/SkillSet/Skill/Gem")
-                         if gem.get("gemId")}
-        summaries.append({**phase, "mainSkill": main_skill, "gems": [main_skill, *supports],
-                          "gemLevels": actual_levels, "gear": gear, "stats": calc["stats"], "validation": checks,
-                          "uniquePackageCostChaos": mapping_package_price if phase["act"] == 11 else None,
-                          "uniquePackage": ([_item_parts(text)[1] for text in stage_uniques.values()]
-                                            if phase["act"] == 11 else []),
-                          "passives": calc["passives"]["used"], "passiveBudget": phase["level"] - 1 + phase["questPoints"] +
-                          max(0, calc["stats"].get("ExtraPoints", 1) - 1),
-                          "_calculation": calc,
-                          "instructions": instructions})
+        summaries.append(_stage_summary(export["xml"], phase, main_skill, instructions, calc, checks, data,
+                                        stage_uniques, mapping_package_price, market, budget_cap))
     xml = combine_loadouts(documents, phases, build_notes(spec, summaries))
     loadouts = worker.request("loadouts", xml=xml)["loadouts"]
     if any(phase["title"] not in loadouts for phase in phases):
@@ -618,13 +928,21 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
     for index, summary in enumerate(summaries, 1):
         selected_xml = select_stage(xml, index, summary["level"])
         calc = worker.request("calculate", xml=selected_xml)
-        merged_checks = stage_checks(selected_xml, summary, calc, data, context)
+        merged_checks = _waive_mana(stage_checks(selected_xml, summary, calc, data, context),
+                                    (summary.get("warnings") or [None])[0])
         failures = [entry["name"] for entry in merged_checks if not entry["passed"]]
         if failures:
             raise ValueError("Merged loadout made " + summary["title"] +
                              " invalid: " + ", ".join(
                                  entry["name"] + ": " + entry["reason"]
                                  for entry in merged_checks if not entry["passed"]))
+        merged = _stage_summary(selected_xml, summary, summary["mainSkill"], summary["instructions"], calc,
+                                merged_checks, data, None, summary.get("uniquePackageCostChaos"), market,
+                                budget_cap)
+        # The merged, selected loadout is authoritative for what a user imports.
+        drift = [name for name in ("gems", "socketedGemCount") if merged[name] != summary[name]]
+        if drift or [row["name"] for row in merged["gear"]] != [row["name"] for row in summary["gear"]]:
+            raise ValueError(f"Merged loadout changed the equipment or skills of {summary['title']}")
         if calc["stats"] != summary["stats"] or calc["passives"]["used"] != summary["passives"]:
             changed = {key: {"stage": summary["stats"].get(key), "merged": calc["stats"].get(key)}
                        for key in set(summary["stats"]) | set(calc["stats"])
@@ -640,3 +958,43 @@ def add_progression(endgame_xml: str, spec: dict, context: dict, data, worker, s
             summary["validation"] = merged_checks
             summary["_calculation"] = calc
     return xml, summaries
+
+
+def _stage_summary(final_xml: str, phase: dict, main_skill: str, instructions: list[str], calc: dict,
+                   checks: list[dict], data, stage_uniques, package_price, market, budget) -> dict:
+    """Everything a stage reports, derived from its final exported XML."""
+    loadout = summarize_loadout(final_xml, data.gems)
+    gear = _gear_rows(loadout)
+    levels = {}
+    for group in loadout["groups"]:
+        for gem in group["gems"]:
+            if gem["socketed"] and gem["level"] is not None:
+                levels.setdefault(gem["name"], gem["level"])
+    price = None
+    if market is not None:
+        price = price_unique_equipment(
+            [{**row, "slot": row["slot"]} for row in gear] +
+            [{"slot": "Jewel " + jewel["node"], "name": jewel["name"], "base": jewel["base"],
+              "rarity": jewel["rarity"], "variant": jewel["variant"], "corrupted": jewel["corrupted"],
+              "links": None} for jewel in loadout["jewels"]],
+            market, budget, scope="stage_equipped_uniques", label=phase["title"])
+    is_mapping = phase.get("act") == 11
+    unique_names = [row["name"] for row in gear if row["isUnique"] and not row["slot"].startswith("Flask")]
+    cost = (price["uniqueSubtotalChaos"] if price is not None and not price["unknown"] else
+            None if price is not None else package_price if is_mapping else None)
+    summary = {**phase, "mainSkill": main_skill, "gems": loadout["mainLinkGems"], "gemLevels": levels,
+               "gear": gear, "stats": calc["stats"], "validation": checks,
+               "uniquePackageCostChaos": cost if is_mapping else None,
+               "uniquePackage": unique_names if is_mapping else [],
+               "stageUniques": unique_names,
+               "priceCoverage": price,
+               "passives": calc["passives"]["used"],
+               "passiveBudget": phase["level"] - 1 + phase["questPoints"] + max(0, calc["stats"].get("ExtraPoints", 1) - 1),
+               "_calculation": calc, "instructions": list(instructions),
+               "warnings": [text for text in instructions if text.startswith("WARNING")]}
+    summary.update(_stage_loadout_fields(loadout))
+    if not any(text.startswith("Use the shown") for text in summary["instructions"]):
+        summary["instructions"].append(
+            f"Use the shown {len(loadout['mainLinkGems'])}-gem main link; keep enough free mana to use "
+            f"{main_skill}. Upgrade your mana flask as needed.")
+    return summary

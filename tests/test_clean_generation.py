@@ -173,7 +173,7 @@ class CleanGeneration(unittest.TestCase):
         chosen = support_candidate_shortlist(ids, data, {"skill": "Raise Zombie", "archetype": "minion",
                                                            "damageType": "physical"}, limit=2)
         names = [data.by_id[identifier]["name"] for identifier in chosen]
-        self.assertEqual(names, ["Melee Physical Damage", "Minion Damage"])
+        self.assertEqual(names, ["Minion Damage", "Melee Physical Damage"])
         expanded = support_candidate_shortlist(ids, data, {"skill": "Raise Zombie", "archetype": "minion",
                                                             "damageType": "physical"}, limit=3)
         self.assertIn("Chance to Poison", [data.by_id[identifier]["name"] for identifier in expanded])
@@ -381,8 +381,10 @@ class CleanGeneration(unittest.TestCase):
         spec = normalize_intent("Ethereal Knives with Hatred", {}, definitions(), {"divineChaos": 200})
         self.assertIn("Hatred", spec["utility"])
         self.assertNotIn("Determination", spec["utility"])
-        with self.assertRaisesRegex(ValueError, "Chaos Inoculation"):
-            normalize_intent("Winter Orb chaos inoculation", {}, definitions(), {"divineChaos": 200})
+        ci = normalize_intent("Winter Orb chaos inoculation", {}, definitions(), {"divineChaos": 200})
+        self.assertEqual(ci["defenseModel"], "ci")
+        with self.assertRaisesRegex(ValueError, "low life"):
+            normalize_intent("Winter Orb low life", {}, definitions(), {"divineChaos": 200})
 
     def test_curse_choices_follow_the_requested_damage_mechanism(self):
         cold = normalize_intent("Level 90 Winter Orb Elementalist", {}, definitions(),
@@ -806,7 +808,7 @@ class CleanGeneration(unittest.TestCase):
                                             "LifeCost": 100, "LifeRegenRecovery": 0,
                                             "Duration": 8.2, "ActiveMinionLimit": 20}}))
         self.assertEqual(unsustainable_life["minionCount"], 1)
-        self.assertFalse(unsustainable_life["_srsPopulationSustainable"])
+        self.assertFalse(unsustainable_life["_populationSustainable"])
 
     def test_ignite_objective_does_not_optimize_unrequested_poison_damage(self):
         self.assertEqual(target_dps({"IgniteDPS": 100, "FullDotDPS": 1000}, {"archetype": "ignite"}), 100)
@@ -823,8 +825,8 @@ class CleanGeneration(unittest.TestCase):
                                           profile)
         self.assertEqual(status, "experimental")
         self.assertTrue(any("below estimated skill use" in warning for warning in warnings))
-        self.assertTrue(any("Temporary SRS population" in warning for warning in warnings))
-        sustained_spec = {"skill": "Summon Raging Spirit", "_srsPopulationSustainable": True}
+        self.assertTrue(any("Temporary minion population" in warning for warning in warnings))
+        sustained_spec = {"skill": "Summon Raging Spirit", "_populationSustainable": True}
         _, sustained_warnings = assess_quality(
             sustained_spec, {"stats": {"ManaCost": 56, "Speed": 2.26, "ManaRegen": 14.5}}, profile)
         self.assertFalse(any("below estimated skill use" in warning for warning in sustained_warnings))
@@ -850,7 +852,7 @@ class CleanGeneration(unittest.TestCase):
         self.assertEqual(warnings, [])
         limited, limited_warnings = assess_quality(spec, calculation, profile, checks, search_limited=True)
         self.assertEqual(limited, "experimental")
-        self.assertTrue(any("2,000-evaluation limit" in warning for warning in limited_warnings))
+        self.assertTrue(any("evaluation limit" in warning for warning in limited_warnings))
         missing, missing_warnings = assess_quality(spec, calculation, profile)
         self.assertEqual(missing, "experimental")
         self.assertTrue(any("checks were not supplied" in warning for warning in missing_warnings))
@@ -874,9 +876,9 @@ class CleanGeneration(unittest.TestCase):
                        "passives": {"used": 70, "maximum": 113}},
             generic_profile, search_limited=True)
         self.assertEqual(generic_status, "experimental")
-        for phrase in ("No tested mechanic profile", "Mana regeneration", "life plus energy shield",
+        for phrase in ("Mana regeneration", "life plus energy shield",
                        "effective hit pool", "Fire resistance", "passive points remain unspent",
-                       "2,000-evaluation limit"):
+                       "evaluation limit"):
             self.assertTrue(any(phrase in warning for warning in generic_warnings), phrase)
 
     def test_mechanic_activation_checks_are_separate_from_quality_warnings(self):
@@ -886,7 +888,7 @@ class CleanGeneration(unittest.TestCase):
                                   '<PathOfBuilding><Tree><Spec nodes="12"/></Tree></PathOfBuilding>',
                                   {"tree": {"nodes": {"12": {"name": "Other"}}}})
         self.assertEqual([check["name"] for check in checks], [
-            "Tested mechanic profile", "Main-skill damage calculated", "Compatible ascendancy",
+            "Mechanic profile", "Main-skill damage calculated", "Compatible ascendancy",
             "Compatible utility choices", "Shaper of Flames allocated", "Ignite damage active"])
         self.assertTrue(checks[1]["passed"])
         self.assertTrue(checks[2]["passed"])
@@ -937,28 +939,28 @@ class CleanGeneration(unittest.TestCase):
         self.assertEqual(candidate_minion_count(stats, spec), 15)
         self.assertTrue(sync_permanent_minion_count(spec, {"stats": stats}))
         self.assertEqual(spec["minionCount"], 15)
-        self.assertTrue(spec["_temporaryPopulationSustainable"])
+        self.assertTrue(spec["_populationSustainable"])
         recounted = recounted_stats(stats, {**spec, "minionCount": 1})
         self.assertEqual(recounted["FullDPS"], 15000)
 
         profile = mechanic_profile({"ascendancy": "Occultist", "skill": "Animate Weapon",
                                     "archetype": "minion", "damageType": "physical"})
-        self.assertEqual(profile["name"], "generic_experimental")
-        self.assertIn("weapon duration", profile["requiredInteractions"])
+        self.assertEqual(profile["name"], "derived_minion_temporary")
+        self.assertIn("minion lifetime", profile["requiredInteractions"])
         _, warnings = assess_quality(spec, {"stats": stats}, profile)
         self.assertFalse(any("below estimated skill use" in warning for warning in warnings))
         checks = assess_mechanics(spec, {"stats": stats}, profile,
                                   "<PathOfBuilding><Tree><Spec nodes=\"1\"/></Tree></PathOfBuilding>",
                                   {"tree": {"nodes": {"1": {"name": "Witch Start"}}}})
         self.assertTrue(next(check["passed"] for check in checks
-                             if check["name"] == "Temporary weapon population modeled"))
+                             if check["name"] == "Temporary minion population modeled"))
 
-        unsustainable = {**spec, "minionCount": 1, "_temporaryPopulationSustainable": False}
+        unsustainable = {**spec, "minionCount": 1, "_populationSustainable": False}
         low_regen = {**stats, "ManaRegen": 0}
         sync_permanent_minion_count(unsustainable, {"stats": low_regen})
-        self.assertFalse(unsustainable["_temporaryPopulationSustainable"])
+        self.assertFalse(unsustainable["_populationSustainable"])
         _, warnings = assess_quality(unsustainable, {"stats": low_regen}, profile)
-        self.assertTrue(any("not derived from summon rate" in warning for warning in warnings))
+        self.assertTrue(any("population is not sustained" in warning for warning in warnings))
 
     def test_final_tree_search_respects_points_already_spent_on_masteries(self):
         # The raw regular-node count understates paid points after masteries.
@@ -1194,7 +1196,7 @@ class CleanGeneration(unittest.TestCase):
                     "FireResist": fire, "ColdResist": 75, "LightningResist": 75,
                     "Str": 100, "Dex": 100, "Int": 100}
 
-        def repair_suffixes(_items, _data, output):
+        def repair_suffixes(_items, _data, output, **_kwargs):
             if output.get("FireResist", 75) < 75:
                 repair_state["applied"] = True
                 return 1
@@ -1241,7 +1243,7 @@ class CleanGeneration(unittest.TestCase):
                                  "kind": "prefix", "group": "Life"}])
         gear_options = [("Already Equipped", f"Slot {index}", equipped_unique, None)
                         for index in range(8)]
-        gear_options.append(("New Candidate", "Belt", "Rarity: UNIQUE\nNew Candidate\nLeather Belt", None))
+        gear_options.append(("New Candidate", "Belt", "Rarity: UNIQUE\nNew Candidate\nLeather Belt", 5.0))
         budget, trace = SearchBudget(30), []
         with patch("real_generator.assemble", side_effect=fake_assemble), \
                 patch("real_generator.solve_suffixes", side_effect=repair_suffixes):

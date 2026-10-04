@@ -12,6 +12,8 @@ import re
 import time
 from pathlib import Path
 
+from build_evaluation import final_quality_report
+from loadout_summary import loadout_view
 from generation_data import GameData
 from pob_engine import find_pob_installation
 from pob_engine import get_worker
@@ -55,6 +57,7 @@ def main() -> int:
     # progression tables from the installed PoB after the caller has pinned
     # the expected version.
     if (any(not gem.get("levels") for gem in metadata.get("gems", []))
+            or any("skillTypes" not in gem for gem in metadata.get("gems", []))
             or not metadata.get("jewelMods")):
         live_metadata = get_worker(ROOT, DATA).request("metadata")
         live_by_id = {gem["id"]: gem for gem in live_metadata.get("gems", [])}
@@ -62,11 +65,27 @@ def main() -> int:
             live_gem = live_by_id.get(gem["id"])
             if live_gem:
                 gem["levels"] = live_gem.get("levels", [])
+                for key in ("skillTypes", "createsMinions", "baseEffectiveness", "statIds", "legacy"):
+                    if key in live_gem:
+                        gem[key] = live_gem[key]
         if not metadata.get("jewelMods"):
             metadata["jewelMods"] = live_metadata.get("jewelMods", [])
         print("Filled missing installed gem progression or jewel modifier data", flush=True)
+    supplemented = (["gem levels", "jewelMods"] if "live_metadata" in locals() else [])
     data = GameData(metadata)
     data.unique_items = get_worker(ROOT, DATA).request("uniques").get("items", [])
+    effective_inputs = {
+        "effectiveMetadataSha256": hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest(),
+        "metadataSupplementedFromLivePob": supplemented,
+        "jewelModCount": len(metadata.get("jewelMods", [])),
+        "uniqueCatalogueCount": len(data.unique_items),
+        "uniqueCatalogueSha256": hashlib.sha256(json.dumps(
+            [(u.get("name"), u.get("base"), u.get("selectedVersion"), u.get("selectedVariant"))
+             for u in data.unique_items], sort_keys=True).encode()).hexdigest(),
+        "marketSchema": {"hasListings": bool(market.get("listings")), "priceKeys": sorted(market.keys())[:12],
+                         "updated": market.get("updated")},
+        "league": context.get("league"),
+    }
     spec = normalize_intent(args.prompt, {}, data, market)
     spec["requestedUniques"] = mentioned_uniques(args.prompt, context, data.unique_items)
     trace = []
@@ -99,7 +118,13 @@ def main() -> int:
     mechanic_checks = assess_mechanics(spec, calculation, recipe.get("mechanics") or mechanic_profile(spec),
                                        xml, context)
     status, warnings = assess_quality(spec, calculation, recipe.get("mechanics") or mechanic_profile(spec),
-                                      mechanic_checks, bool(recipe.get("searchLimitWarning")))
+                                      mechanic_checks, bool(recipe.get("searchLimitWarning")),
+                                      recipe.get("qualityDiagnostics"))
+    quality_report = final_quality_report(xml, spec, calculation, mechanic_checks,
+                                          recipe.get("qualityDiagnostics", {}), data,
+                                          search_limited=bool(recipe.get("searchLimitWarning")),
+                                          assessed_status=status).to_dict()
+    status = quality_report["status"] if status == "validated" else status
     stamp = time.strftime("%Y%m%d-%H%M%S")
     slug = re.sub(r"[^a-z0-9]+", "-", spec["skill"].lower()).strip("-")[:36] or "build"
     stem = f"{stamp}-{slug}-{spec['level']}"
@@ -113,13 +138,16 @@ def main() -> int:
         "treeVersion": context["treeVersion"], "officialTreeRelease": context["officialRelease"],
         "pobVersion": pob_version, "skill": spec["skill"], "ascendancy": spec["ascendancy"],
         "level": spec["level"], "spec": spec, "qualityStatus": status,
-        "qualityWarnings": warnings, "recipe": recipe, "validation": checks,
+        "effectiveInputs": effective_inputs,
+        "searchShares": recipe.get("searchShares"),
+        "qualityWarnings": warnings, "qualityReport": quality_report, "recipe": recipe, "validation": checks,
         "completeness": recipe.get("qualityDiagnostics", {}).get("completeness"),
         "encounterReadiness": recipe.get("qualityDiagnostics", {}).get("encounterReadiness"),
         "priceCoverage": recipe.get("qualityDiagnostics", {}).get("priceCoverage"),
         "mechanicChecks": mechanic_checks,
         "stats": calculation.get("stats", {}), "quote": price,
         "gear": details.get("gear", []),
+        "loadout": loadout_view(xml, data.gems), "progression": recipe.get("progression", []),
         "evaluationCount": recipe.get("designEvaluations", 0),
         "pobCalls": recipe.get("evaluations", 0),
         "runtimeSeconds": round(time.perf_counter() - started, 3),
